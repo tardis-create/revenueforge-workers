@@ -13,6 +13,7 @@ type Bindings = {
   TWILIO_PHONE_NUMBER: string
   NOTIFICATION_EMAIL_TO: string
   ADMIN_WHATSAPP_NUMBER: string
+  PRODUCT_IMAGES: R2Bucket
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -494,27 +495,439 @@ app.post('/api/contact', async (c) => {
   }
 })
 
-// Products
+// ============ PRODUCTS API ============
+
+// Product type definition
+type Product = {
+  id: string
+  sku: string
+  name: string
+  description: string | null
+  category: string | null
+  base_price: number
+  cost_price: number | null
+  unit: string | null
+  stock_quantity: number | null
+  is_active: number
+  specifications: string | null
+  image_url: string | null
+  created_at: string
+  updated_at: string
+}
+
+// Helper to generate product ID
+function generateProductId(): string {
+  return 'prod_' + crypto.randomUUID().replace(/-/g, '').substring(0, 16)
+}
+
+// GET /api/products - List products with pagination, filtering, and search
 app.get('/api/products', async (c) => {
   try {
-    const { results } = await c.env.DB.prepare('SELECT * FROM products ORDER BY created_at DESC').all()
-    return c.json({ success: true, data: results })
+    // Pagination params
+    const page = Math.max(1, parseInt(c.req.query('page') || '1'))
+    const limit = Math.min(100, Math.max(1, parseInt(c.req.query('limit') || '20')))
+    const offset = (page - 1) * limit
+
+    // Filter params
+    const category = c.req.query('category')
+    const search = c.req.query('search')
+    const includeInactive = c.req.query('include_inactive') === 'true'
+
+    // Build query
+    let whereClauses: string[] = []
+    let bindParams: any[] = []
+
+    if (!includeInactive) {
+      whereClauses.push('is_active = 1')
+    }
+
+    if (category) {
+      whereClauses.push('category = ?')
+      bindParams.push(category)
+    }
+
+    if (search) {
+      whereClauses.push('(name LIKE ? OR sku LIKE ?)')
+      bindParams.push(`%${search}%`, `%${search}%`)
+    }
+
+    const whereClause = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : ''
+
+    // Get total count
+    const countResult = await c.env.DB.prepare(
+      `SELECT COUNT(*) as total FROM products ${whereClause}`
+    ).bind(...bindParams).first() as { total: number }
+
+    // Get paginated results
+    const { results } = await c.env.DB.prepare(
+      `SELECT * FROM products ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`
+    ).bind(...bindParams, limit, offset).all()
+
+    const products = (results || []) as Product[]
+
+    return c.json({
+      success: true,
+      data: products,
+      pagination: {
+        page,
+        limit,
+        total: countResult?.total || 0,
+        totalPages: Math.ceil((countResult?.total || 0) / limit)
+      }
+    })
   } catch (error) {
+    console.error('Get products error:', error)
     return c.json({ error: 'Failed to fetch products' }, 500)
   }
 })
 
+// GET /api/products/:id - Get single product
+app.get('/api/products/:id', async (c) => {
+  try {
+    const id = c.req.param('id')
+    
+    const product = await c.env.DB.prepare(
+      'SELECT * FROM products WHERE id = ?'
+    ).bind(id).first() as Product | null
+
+    if (!product) {
+      return c.json({ error: 'Product not found' }, 404)
+    }
+
+    return c.json({
+      success: true,
+      data: product
+    })
+  } catch (error) {
+    console.error('Get product error:', error)
+    return c.json({ error: 'Failed to fetch product' }, 500)
+  }
+})
+
+// POST /api/products - Create new product
 app.post('/api/products', async (c) => {
   try {
     const body = await c.req.json()
-    const id = crypto.randomUUID()
+    
+    // Validate required fields
+    if (!body.sku || !body.name) {
+      return c.json({ error: 'SKU and name are required' }, 400)
+    }
+
+    // Check for duplicate SKU
+    const existing = await c.env.DB.prepare(
+      'SELECT id FROM products WHERE sku = ?'
+    ).bind(body.sku).first()
+
+    if (existing) {
+      return c.json({ error: 'Product with this SKU already exists' }, 409)
+    }
+
+    const id = generateProductId()
+    const now = new Date().toISOString()
+
+    // Parse specifications if provided as object
+    let specifications = body.specifications
+    if (specifications && typeof specifications === 'object') {
+      specifications = JSON.stringify(specifications)
+    }
+
+    await c.env.DB.prepare(`
+      INSERT INTO products (
+        id, sku, name, description, category, base_price, cost_price, 
+        unit, stock_quantity, is_active, specifications, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      id,
+      body.sku,
+      body.name,
+      body.description || null,
+      body.category || null,
+      body.base_price || 0,
+      body.cost_price || 0,
+      body.unit || 'pcs',
+      body.stock_quantity || 0,
+      body.is_active !== undefined ? (body.is_active ? 1 : 0) : 1,
+      specifications || null,
+      now,
+      now
+    ).run()
+
+    // Fetch the created product
+    const product = await c.env.DB.prepare(
+      'SELECT * FROM products WHERE id = ?'
+    ).bind(id).first() as Product
+
+    return c.json({
+      success: true,
+      message: 'Product created successfully',
+      data: product
+    }, 201)
+  } catch (error) {
+    console.error('Create product error:', error)
+    return c.json({ error: 'Failed to create product' }, 500)
+  }
+})
+
+// PUT /api/products/:id - Update product
+app.put('/api/products/:id', async (c) => {
+  try {
+    const id = c.req.param('id')
+    const body = await c.req.json()
+
+    // Check if product exists
+    const existing = await c.env.DB.prepare(
+      'SELECT * FROM products WHERE id = ?'
+    ).bind(id).first() as Product | null
+
+    if (!existing) {
+      return c.json({ error: 'Product not found' }, 404)
+    }
+
+    // If SKU is being changed, check for duplicates
+    if (body.sku && body.sku !== existing.sku) {
+      const duplicateSku = await c.env.DB.prepare(
+        'SELECT id FROM products WHERE sku = ? AND id != ?'
+      ).bind(body.sku, id).first()
+
+      if (duplicateSku) {
+        return c.json({ error: 'Product with this SKU already exists' }, 409)
+      }
+    }
+
+    const now = new Date().toISOString()
+
+    // Parse specifications if provided as object
+    let specifications = body.specifications !== undefined ? body.specifications : existing.specifications
+    if (specifications && typeof specifications === 'object') {
+      specifications = JSON.stringify(specifications)
+    }
+
+    // Build update query dynamically
+    const updates: string[] = []
+    const values: any[] = []
+
+    const fields = ['sku', 'name', 'description', 'category', 'base_price', 'cost_price', 'unit', 'stock_quantity', 'is_active']
+    
+    for (const field of fields) {
+      if (body[field] !== undefined) {
+        updates.push(`${field} = ?`)
+        values.push(body[field])
+      }
+    }
+
+    // Handle specifications separately
+    if (body.specifications !== undefined) {
+      updates.push('specifications = ?')
+      values.push(specifications)
+    }
+
+    updates.push('updated_at = ?')
+    values.push(now)
+    values.push(id)
+
+    await c.env.DB.prepare(
+      `UPDATE products SET ${updates.join(', ')} WHERE id = ?`
+    ).bind(...values).run()
+
+    // Fetch updated product
+    const product = await c.env.DB.prepare(
+      'SELECT * FROM products WHERE id = ?'
+    ).bind(id).first() as Product
+
+    return c.json({
+      success: true,
+      message: 'Product updated successfully',
+      data: product
+    })
+  } catch (error) {
+    console.error('Update product error:', error)
+    return c.json({ error: 'Failed to update product' }, 500)
+  }
+})
+
+// DELETE /api/products/:id - Delete product (soft delete)
+app.delete('/api/products/:id', async (c) => {
+  try {
+    const id = c.req.param('id')
+
+    // Check if product exists
+    const existing = await c.env.DB.prepare(
+      'SELECT id FROM products WHERE id = ?'
+    ).bind(id).first()
+
+    if (!existing) {
+      return c.json({ error: 'Product not found' }, 404)
+    }
+
+    // Soft delete by setting is_active = 0
     const now = new Date().toISOString()
     await c.env.DB.prepare(
-      'INSERT INTO products (id, name, sku, category, industry, description, technical_specs, price_range, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)'
-    ).bind(id, body.name, body.sku, body.category, body.industry, body.description, JSON.stringify(body.technical_specs), body.price_range, now).run()
-    return c.json({ success: true, id })
+      'UPDATE products SET is_active = 0, updated_at = ? WHERE id = ?'
+    ).bind(now, id).run()
+
+    return new Response(null, { status: 204 })
   } catch (error) {
-    return c.json({ error: 'Failed to create product' }, 500)
+    console.error('Delete product error:', error)
+    return c.json({ error: 'Failed to delete product' }, 500)
+  }
+})
+
+// POST /api/products/:id/image - Upload product image
+app.post('/api/products/:id/image', async (c) => {
+  try {
+    const id = c.req.param('id')
+
+    // Check if product exists
+    const existing = await c.env.DB.prepare(
+      'SELECT id FROM products WHERE id = ?'
+    ).bind(id).first()
+
+    if (!existing) {
+      return c.json({ error: 'Product not found' }, 404)
+    }
+
+    // Check if R2 bucket is available
+    if (!c.env.PRODUCT_IMAGES) {
+      return c.json({ error: 'Image storage not configured' }, 503)
+    }
+
+    // Get the content type and body
+    const contentType = c.req.header('Content-Type') || ''
+    
+    // Handle multipart/form-data
+    if (contentType.startsWith('multipart/form-data')) {
+      const formData = await c.req.formData()
+      const file = formData.get('image') as File | null
+
+      if (!file) {
+        return c.json({ error: 'No image file provided' }, 400)
+      }
+
+      // Validate file type
+      const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif']
+      if (!allowedTypes.includes(file.type)) {
+        return c.json({ error: 'Invalid image type. Allowed: JPEG, PNG, WebP, GIF' }, 400)
+      }
+
+      // Validate file size (max 5MB)
+      if (file.size > 5 * 1024 * 1024) {
+        return c.json({ error: 'Image too large. Max size: 5MB' }, 400)
+      }
+
+      // Generate unique filename
+      const ext = file.name.split('.').pop() || 'jpg'
+      const key = `${id}/${crypto.randomUUID()}.${ext}`
+
+      // Upload to R2
+      await c.env.PRODUCT_IMAGES.put(key, file.stream(), {
+        httpMetadata: {
+          contentType: file.type
+        }
+      })
+
+      // Construct public URL (assumes R2 public bucket or custom domain)
+      // In production, this would be your R2 public URL or custom domain
+      const imageUrl = `https://products.revenueforge.com/${key}`
+
+      // Update product with image URL
+      const now = new Date().toISOString()
+      await c.env.DB.prepare(
+        'UPDATE products SET image_url = ?, updated_at = ? WHERE id = ?'
+      ).bind(imageUrl, now, id).run()
+
+      return c.json({
+        success: true,
+        message: 'Image uploaded successfully',
+        image_url: imageUrl
+      })
+    }
+
+    // Handle base64 image
+    if (contentType === 'application/json') {
+      const body = await c.req.json()
+      
+      if (!body.image) {
+        return c.json({ error: 'No image data provided' }, 400)
+      }
+
+      // Parse base64 data URL
+      const matches = body.image.match(/^data:(image\/\w+);base64,(.+)$/)
+      if (!matches) {
+        return c.json({ error: 'Invalid base64 image format' }, 400)
+      }
+
+      const mimeType = matches[1]
+      const base64Data = matches[2]
+
+      // Validate mime type
+      const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif']
+      if (!allowedTypes.includes(mimeType)) {
+        return c.json({ error: 'Invalid image type. Allowed: JPEG, PNG, WebP, GIF' }, 400)
+      }
+
+      // Convert base64 to binary
+      const binaryString = atob(base64Data)
+      const bytes = new Uint8Array(binaryString.length)
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i)
+      }
+
+      // Validate size (max 5MB)
+      if (bytes.length > 5 * 1024 * 1024) {
+        return c.json({ error: 'Image too large. Max size: 5MB' }, 400)
+      }
+
+      // Generate unique filename
+      const ext = mimeType.split('/')[1]
+      const key = `${id}/${crypto.randomUUID()}.${ext}`
+
+      // Upload to R2
+      await c.env.PRODUCT_IMAGES.put(key, bytes.buffer, {
+        httpMetadata: {
+          contentType: mimeType
+        }
+      })
+
+      // Construct public URL
+      const imageUrl = `https://products.revenueforge.com/${key}`
+
+      // Update product with image URL
+      const now = new Date().toISOString()
+      await c.env.DB.prepare(
+        'UPDATE products SET image_url = ?, updated_at = ? WHERE id = ?'
+      ).bind(imageUrl, now, id).run()
+
+      return c.json({
+        success: true,
+        message: 'Image uploaded successfully',
+        image_url: imageUrl
+      })
+    }
+
+    return c.json({ error: 'Content-Type must be multipart/form-data or application/json' }, 400)
+  } catch (error) {
+    console.error('Upload image error:', error)
+    return c.json({ error: 'Failed to upload image' }, 500)
+  }
+})
+
+// GET /api/products/categories - Get all product categories
+app.get('/api/products/categories', async (c) => {
+  try {
+    const { results } = await c.env.DB.prepare(
+      'SELECT DISTINCT category FROM products WHERE category IS NOT NULL AND is_active = 1 ORDER BY category'
+    ).all()
+
+    const categories = (results || []).map((r: any) => r.category)
+
+    return c.json({
+      success: true,
+      data: categories
+    })
+  } catch (error) {
+    console.error('Get categories error:', error)
+    return c.json({ error: 'Failed to fetch categories' }, 500)
   }
 })
 
@@ -953,6 +1366,212 @@ app.post('/api/reports/send-daily-summary', async (c) => {
   } catch (error) {
     console.error('Daily summary error:', error)
     return c.json({ error: 'Failed to send daily summary' }, 500)
+  }
+})
+
+// ============ SETTINGS ROUTES ============
+
+// GET /api/settings - Get all settings
+app.get('/api/settings', async (c) => {
+  try {
+    const { results } = await c.env.DB.prepare(
+      'SELECT key, value, type, category, description, is_editable, created_at, updated_at FROM settings ORDER BY category, key'
+    ).all()
+
+    // Parse values based on type
+    const settings = (results || []).map((s: any) => {
+      let parsedValue = s.value
+      if (s.type === 'number') {
+        parsedValue = parseFloat(s.value) || 0
+      } else if (s.type === 'boolean') {
+        parsedValue = s.value === 'true' || s.value === '1'
+      } else if (s.type === 'json') {
+        try {
+          parsedValue = JSON.parse(s.value)
+        } catch {
+          parsedValue = s.value
+        }
+      }
+      return {
+        ...s,
+        value: parsedValue
+      }
+    })
+
+    return c.json({ success: true, data: settings })
+  } catch (error) {
+    console.error('Get settings error:', error)
+    return c.json({ error: 'Failed to fetch settings' }, 500)
+  }
+})
+
+// GET /api/settings/:key - Get single setting by key
+app.get('/api/settings/:key', async (c) => {
+  try {
+    const key = c.req.param('key')
+    
+    const setting = await c.env.DB.prepare(
+      'SELECT key, value, type, category, description, is_editable, created_at, updated_at FROM settings WHERE key = ?'
+    ).bind(key).first() as any
+
+    if (!setting) {
+      return c.json({ error: 'Setting not found' }, 404)
+    }
+
+    // Parse value based on type
+    let parsedValue = setting.value
+    if (setting.type === 'number') {
+      parsedValue = parseFloat(setting.value) || 0
+    } else if (setting.type === 'boolean') {
+      parsedValue = setting.value === 'true' || setting.value === '1'
+    } else if (setting.type === 'json') {
+      try {
+        parsedValue = JSON.parse(setting.value)
+      } catch {
+        parsedValue = setting.value
+      }
+    }
+
+    return c.json({
+      success: true,
+      data: {
+        ...setting,
+        value: parsedValue
+      }
+    })
+  } catch (error) {
+    console.error('Get setting error:', error)
+    return c.json({ error: 'Failed to fetch setting' }, 500)
+  }
+})
+
+// PUT /api/settings - Bulk update settings
+app.put('/api/settings', async (c) => {
+  try {
+    const body = await c.req.json()
+    const { settings } = body
+
+    if (!settings || !Array.isArray(settings) || settings.length === 0) {
+      return c.json({ error: 'Settings array is required' }, 400)
+    }
+
+    const now = new Date().toISOString()
+    const updated: string[] = []
+    const notFound: string[] = []
+    const notEditable: string[] = []
+
+    for (const setting of settings) {
+      const { key, value } = setting
+      
+      if (!key) {
+        continue
+      }
+
+      // Check if setting exists and is editable
+      const existing = await c.env.DB.prepare(
+        'SELECT key, is_editable FROM settings WHERE key = ?'
+      ).bind(key).first() as any
+
+      if (!existing) {
+        notFound.push(key)
+        continue
+      }
+
+      if (!existing.is_editable) {
+        notEditable.push(key)
+        continue
+      }
+
+      // Convert value to string for storage
+      let stringValue: string
+      if (typeof value === 'object') {
+        stringValue = JSON.stringify(value)
+      } else {
+        stringValue = String(value)
+      }
+
+      // Update setting
+      await c.env.DB.prepare(
+        'UPDATE settings SET value = ?, updated_at = ? WHERE key = ?'
+      ).bind(stringValue, now, key).run()
+
+      updated.push(key)
+    }
+
+    return c.json({
+      success: true,
+      message: 'Settings updated',
+      updated,
+      notFound: notFound.length > 0 ? notFound : undefined,
+      notEditable: notEditable.length > 0 ? notEditable : undefined
+    })
+  } catch (error) {
+    console.error('Bulk update settings error:', error)
+    return c.json({ error: 'Failed to update settings' }, 500)
+  }
+})
+
+// PUT /api/settings/:key - Update single setting
+app.put('/api/settings/:key', async (c) => {
+  try {
+    const key = c.req.param('key')
+    const body = await c.req.json()
+    const { value } = body
+
+    // Check if setting exists and is editable
+    const existing = await c.env.DB.prepare(
+      'SELECT key, is_editable, type FROM settings WHERE key = ?'
+    ).bind(key).first() as any
+
+    if (!existing) {
+      return c.json({ error: 'Setting not found' }, 404)
+    }
+
+    if (!existing.is_editable) {
+      return c.json({ error: 'Setting is not editable' }, 403)
+    }
+
+    // Convert value to string for storage
+    let stringValue: string
+    if (typeof value === 'object') {
+      stringValue = JSON.stringify(value)
+    } else {
+      stringValue = String(value)
+    }
+
+    const now = new Date().toISOString()
+
+    // Update setting
+    await c.env.DB.prepare(
+      'UPDATE settings SET value = ?, updated_at = ? WHERE key = ?'
+    ).bind(stringValue, now, key).run()
+
+    // Return the updated value parsed correctly
+    let parsedValue: any = stringValue
+    if (existing.type === 'number') {
+      parsedValue = parseFloat(stringValue) || 0
+    } else if (existing.type === 'boolean') {
+      parsedValue = stringValue === 'true' || stringValue === '1'
+    } else if (existing.type === 'json') {
+      try {
+        parsedValue = JSON.parse(stringValue)
+      } catch {
+        parsedValue = stringValue
+      }
+    }
+
+    return c.json({
+      success: true,
+      message: 'Setting updated',
+      data: {
+        key,
+        value: parsedValue,
+        updated_at: now
+      }
+    })
+  } catch (error) {
+    console.error('Update setting error:', error)
+    return c.json({ error: 'Failed to update setting' }, 500)
   }
 })
 
