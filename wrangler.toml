@@ -23,6 +23,11 @@ NOTIFICATION_EMAIL_TO = "admin@revenueforge.com"
 binding = "PRODUCT_IMAGES"
 bucket_name = "revenueforge-product-images"
 
+# KV namespace for settings cache
+[[kv_namespaces]]
+binding = "CACHE"
+id = "change-me-to-your-kv-namespace-id"
+
 # Secrets (set via wrangler secret put)
 # RESEND_API_KEY
 # TWILIO_ACCOUNT_SID

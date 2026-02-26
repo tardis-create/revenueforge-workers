@@ -5,6 +5,7 @@ import bcrypt from 'bcryptjs'
 
 type Bindings = {
   DB: D1Database
+  CACHE: KVNamespace
   JWT_SECRET: string
   RESEND_API_KEY: string
   RESEND_FROM_EMAIL: string
@@ -15,7 +16,11 @@ type Bindings = {
   ADMIN_WHATSAPP_NUMBER: string
 }
 
-const app = new Hono<{ Bindings: Bindings }>()
+type Variables = {
+  user: any
+}
+
+const app = new Hono<{ Bindings: Bindings; Variables: Variables }>()
 
 // D1-based rate limiting (5 attempts per 60-second window)
 // Uses Unix timestamp (seconds) for window_start
@@ -977,6 +982,200 @@ app.post('/api/reports/send-daily-summary', async (c) => {
   } catch (error) {
     console.error('Daily summary error:', error)
     return c.json({ error: 'Failed to send daily summary' }, 500)
+  }
+})
+
+// ============================================
+// SETTINGS API - White-Label Configuration
+// ============================================
+
+// Branding fields that are safe to expose publicly
+const BRANDING_FIELDS = [
+  'company_name',
+  'logo_url',
+  'primary_color',
+  'accent_color',
+  'tagline',
+  'company_address',
+  'company_phone',
+  'company_email'
+]
+
+// Cache settings in KV for fast access
+const SETTINGS_CACHE_KEY = 'settings:public'
+const SETTINGS_CACHE_TTL = 3600 // 1 hour
+
+// GET /api/settings - Returns branding fields (public access)
+app.get('/api/settings', async (c) => {
+  try {
+    // Try to get from cache first
+    if (c.env.CACHE) {
+      const cached = await c.env.CACHE.get(SETTINGS_CACHE_KEY, 'json')
+      if (cached) {
+        return c.json({ success: true, data: cached, cached: true })
+      }
+    }
+
+    // Fetch branding settings from database
+    const placeholders = BRANDING_FIELDS.map(() => '?').join(',')
+    const { results } = await c.env.DB.prepare(
+      `SELECT key, value, type FROM settings WHERE key IN (${placeholders})`
+    ).bind(...BRANDING_FIELDS).all()
+
+    // Parse values based on type
+    const settings: Record<string, any> = {}
+    for (const row of results || []) {
+      const { key, value, type } = row as any
+      let parsedValue = value
+
+      if (type === 'number') {
+        parsedValue = parseFloat(value) || 0
+      } else if (type === 'boolean') {
+        parsedValue = value === 'true' || value === '1'
+      } else if (type === 'json') {
+        try {
+          parsedValue = JSON.parse(value)
+        } catch {
+          parsedValue = value
+        }
+      }
+
+      settings[key] = parsedValue
+    }
+
+    // Cache in KV
+    if (c.env.CACHE) {
+      await c.env.CACHE.put(SETTINGS_CACHE_KEY, JSON.stringify(settings), {
+        expirationTtl: SETTINGS_CACHE_TTL
+      })
+    }
+
+    return c.json({ success: true, data: settings, cached: false })
+  } catch (error) {
+    console.error('Error fetching settings:', error)
+    return c.json({ error: 'Failed to fetch settings' }, 500)
+  }
+})
+
+// Admin-only endpoint to get ALL settings (including SMTP)
+app.get('/api/settings/admin', authMiddleware, async (c) => {
+  try {
+    const user = c.get('user') as any
+    
+    // Check if user is admin
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin access required' }, 403)
+    }
+
+    // Fetch all settings
+    const { results } = await c.env.DB.prepare(
+      'SELECT key, value, type, category, description, is_editable, created_at, updated_at FROM settings ORDER BY category, key'
+    ).all()
+
+    // Parse values
+    const settings = (results || []).map((row: any) => {
+      let parsedValue = row.value
+
+      if (row.type === 'number') {
+        parsedValue = parseFloat(row.value) || 0
+      } else if (row.type === 'boolean') {
+        parsedValue = row.value === 'true' || row.value === '1'
+      } else if (row.type === 'json') {
+        try {
+          parsedValue = JSON.parse(row.value)
+        } catch {
+          parsedValue = row.value
+        }
+      }
+
+      return {
+        key: row.key,
+        value: parsedValue,
+        type: row.type,
+        category: row.category,
+        description: row.description,
+        is_editable: row.is_editable === 1,
+        created_at: row.created_at,
+        updated_at: row.updated_at
+      }
+    })
+
+    return c.json({ success: true, data: settings })
+  } catch (error) {
+    console.error('Error fetching admin settings:', error)
+    return c.json({ error: 'Failed to fetch settings' }, 500)
+  }
+})
+
+// PATCH /api/settings - Update settings (admin only)
+app.patch('/api/settings', authMiddleware, async (c) => {
+  try {
+    const user = c.get('user') as any
+    
+    // Check if user is admin
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin access required' }, 403)
+    }
+
+    const body = await c.req.json()
+    const { settings } = body
+
+    if (!settings || typeof settings !== 'object' || Object.keys(settings).length === 0) {
+      return c.json({ error: 'Settings object is required' }, 400)
+    }
+
+    const updated: string[] = []
+    const notFound: string[] = []
+    const notEditable: string[] = []
+
+    // Update each setting
+    for (const [key, value] of Object.entries(settings)) {
+      // Check if setting exists
+      const existing = await c.env.DB.prepare(
+        'SELECT key, is_editable FROM settings WHERE key = ?'
+      ).bind(key).first() as any
+
+      if (!existing) {
+        notFound.push(key)
+        continue
+      }
+
+      if (!existing.is_editable) {
+        notEditable.push(key)
+        continue
+      }
+
+      // Convert value to string for storage
+      let valueStr: string
+      if (typeof value === 'object') {
+        valueStr = JSON.stringify(value)
+      } else {
+        valueStr = String(value)
+      }
+
+      // Update setting
+      await c.env.DB.prepare(
+        'UPDATE settings SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE key = ?'
+      ).bind(valueStr, key).run()
+
+      updated.push(key)
+    }
+
+    // Invalidate cache
+    if (c.env.CACHE && updated.length > 0) {
+      await c.env.CACHE.delete(SETTINGS_CACHE_KEY)
+    }
+
+    return c.json({
+      success: true,
+      message: 'Settings updated',
+      updated,
+      notFound: notFound.length > 0 ? notFound : undefined,
+      notEditable: notEditable.length > 0 ? notEditable : undefined
+    })
+  } catch (error) {
+    console.error('Error updating settings:', error)
+    return c.json({ error: 'Failed to update settings' }, 500)
   }
 })
 
