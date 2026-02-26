@@ -17,36 +17,60 @@ type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>()
 
-// In-memory rate limiting: Map<email, { count: number, resetAt: number }>
-const loginAttempts = new Map<string, { count: number; resetAt: number }>()
+// D1-based rate limiting (5 attempts per 60-second window)
+// Uses Unix timestamp (seconds) for window_start
+const RATE_LIMIT_WINDOW_SECONDS = 60
+const RATE_LIMIT_MAX_ATTEMPTS = 5
 
-// Clean up old rate limit entries periodically
-setInterval(() => {
-  const now = Date.now()
-  for (const [email, data] of loginAttempts) {
-    if (data.resetAt < now) {
-      loginAttempts.delete(email)
+async function checkRateLimit(
+  db: D1Database, 
+  email: string
+): Promise<{ allowed: boolean; remaining: number; resetIn: number }> {
+  const nowSeconds = Math.floor(Date.now() / 1000)
+  const windowExpiry = nowSeconds - RATE_LIMIT_WINDOW_SECONDS
+  
+  // Get current rate limit record
+  const record = await db.prepare(
+    'SELECT attempts, window_start FROM rate_limit WHERE email = ?'
+  ).bind(email.toLowerCase()).first() as { attempts: number; window_start: number } | null
+  
+  // No record or window expired - start fresh
+  if (!record || record.window_start < windowExpiry) {
+    await db.prepare(
+      'INSERT OR REPLACE INTO rate_limit (email, attempts, window_start) VALUES (?, 1, ?)'
+    ).bind(email.toLowerCase(), nowSeconds).run()
+    
+    return { 
+      allowed: true, 
+      remaining: RATE_LIMIT_MAX_ATTEMPTS - 1, 
+      resetIn: RATE_LIMIT_WINDOW_SECONDS * 1000 
     }
   }
-}, 60000) // Clean every minute
+  
+  // Check if limit exceeded
+  if (record.attempts >= RATE_LIMIT_MAX_ATTEMPTS) {
+    const resetIn = ((record.window_start + RATE_LIMIT_WINDOW_SECONDS) - nowSeconds) * 1000
+    return { allowed: false, remaining: 0, resetIn: Math.max(0, resetIn) }
+  }
+  
+  // Increment attempts
+  const newAttempts = record.attempts + 1
+  await db.prepare(
+    'UPDATE rate_limit SET attempts = ? WHERE email = ?'
+  ).bind(newAttempts, email.toLowerCase()).run()
+  
+  const resetIn = ((record.window_start + RATE_LIMIT_WINDOW_SECONDS) - nowSeconds) * 1000
+  return { 
+    allowed: true, 
+    remaining: RATE_LIMIT_MAX_ATTEMPTS - newAttempts, 
+    resetIn: Math.max(0, resetIn) 
+  }
+}
 
-// Check rate limit for login (5 attempts per minute)
-function checkRateLimit(email: string): { allowed: boolean; remaining: number; resetIn: number } {
-  const now = Date.now()
-  const record = loginAttempts.get(email)
-  
-  if (!record || record.resetAt < now) {
-    // New window
-    loginAttempts.set(email, { count: 1, resetAt: now + 60000 })
-    return { allowed: true, remaining: 4, resetIn: 60000 }
-  }
-  
-  if (record.count >= 5) {
-    return { allowed: false, remaining: 0, resetIn: record.resetAt - now }
-  }
-  
-  record.count++
-  return { allowed: true, remaining: 5 - record.count, resetIn: record.resetAt - now }
+// Cleanup expired rate limit entries (call periodically)
+async function cleanupRateLimits(db: D1Database): Promise<void> {
+  const windowExpiry = Math.floor(Date.now() / 1000) - RATE_LIMIT_WINDOW_SECONDS
+  await db.prepare('DELETE FROM rate_limit WHERE window_start < ?').bind(windowExpiry).run()
 }
 
 // JWT helpers
@@ -360,7 +384,7 @@ app.post('/api/auth/login', async (c) => {
     }
 
     // Check rate limit
-    const rateLimit = checkRateLimit(email.toLowerCase())
+    const rateLimit = await checkRateLimit(c.env.DB, email)
     if (!rateLimit.allowed) {
       c.header('Retry-After', String(Math.ceil(rateLimit.resetIn / 1000)))
       return c.json({
