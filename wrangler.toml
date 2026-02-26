@@ -8,6 +8,11 @@ binding = "DB"
 database_name = "revenueforge-db"
 database_id = "da0624be-7f9c-4fc7-809a-c79c5641896b"
 
+# R2 bucket for product images
+[[r2_buckets]]
+binding = "PRODUCTS_BUCKET"
+bucket_name = "revenueforge-products"
+
 # Cron triggers for automated notifications
 [[triggers]]
 crons = ["0 9 * * *", "0 */2 * * *"]

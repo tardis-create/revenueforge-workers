@@ -13,6 +13,7 @@ type Bindings = {
   TWILIO_PHONE_NUMBER: string
   NOTIFICATION_EMAIL_TO: string
   ADMIN_WHATSAPP_NUMBER: string
+  PRODUCTS_BUCKET: R2Bucket
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -494,27 +495,309 @@ app.post('/api/contact', async (c) => {
   }
 })
 
-// Products
+// ============ PRODUCTS API (RF-B02) ============
+
+// GET /api/products - List products with pagination, category filter, and search
 app.get('/api/products', async (c) => {
   try {
-    const { results } = await c.env.DB.prepare('SELECT * FROM products ORDER BY created_at DESC').all()
-    return c.json({ success: true, data: results })
+    // Pagination parameters
+    const page = parseInt(c.req.query('page') || '1')
+    const limit = parseInt(c.req.query('limit') || '20')
+    const offset = (page - 1) * limit
+
+    // Filter parameters
+    const category = c.req.query('category')
+    const search = c.req.query('search')
+
+    // Build query with filters
+    let whereClause = 'WHERE deleted_at IS NULL'
+    const params: any[] = []
+
+    if (category) {
+      whereClause += ' AND category = ?'
+      params.push(category)
+    }
+
+    if (search) {
+      whereClause += ' AND (name LIKE ? OR description LIKE ?)'
+      const searchTerm = `%${search}%`
+      params.push(searchTerm, searchTerm)
+    }
+
+    // Get total count
+    const countQuery = `SELECT COUNT(*) as total FROM products ${whereClause}`
+    const countResult = await c.env.DB.prepare(countQuery).bind(...params).first() as any
+    const total = countResult?.total || 0
+
+    // Get paginated results
+    const dataQuery = `SELECT * FROM products ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`
+    const { results } = await c.env.DB.prepare(dataQuery).bind(...params, limit, offset).all()
+
+    return c.json({
+      success: true,
+      data: results,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+        hasMore: offset + limit < total
+      }
+    })
   } catch (error) {
+    console.error('Products fetch error:', error)
     return c.json({ error: 'Failed to fetch products' }, 500)
   }
 })
 
+// GET /api/products/:id - Get single product
+app.get('/api/products/:id', async (c) => {
+  try {
+    const id = c.req.param('id')
+    const product = await c.env.DB.prepare(
+      'SELECT * FROM products WHERE id = ? AND deleted_at IS NULL'
+    ).bind(id).first()
+
+    if (!product) {
+      return c.json({ error: 'Product not found' }, 404)
+    }
+
+    return c.json({
+      success: true,
+      data: product
+    })
+  } catch (error) {
+    console.error('Product fetch error:', error)
+    return c.json({ error: 'Failed to fetch product' }, 500)
+  }
+})
+
+// POST /api/products - Create new product
 app.post('/api/products', async (c) => {
   try {
     const body = await c.req.json()
+    const { name, sku, category, industry, description, technical_specs, price_range, image_url } = body
+
+    // Validation
+    if (!name || !sku) {
+      return c.json({ error: 'Name and SKU are required' }, 400)
+    }
+
     const id = crypto.randomUUID()
     const now = new Date().toISOString()
-    await c.env.DB.prepare(
-      'INSERT INTO products (id, name, sku, category, industry, description, technical_specs, price_range, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)'
-    ).bind(id, body.name, body.sku, body.category, body.industry, body.description, JSON.stringify(body.technical_specs), body.price_range, now).run()
-    return c.json({ success: true, id })
+
+    await c.env.DB.prepare(`
+      INSERT INTO products (id, name, sku, category, industry, description, technical_specs, price_range, image_url, is_active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    `).bind(
+      id,
+      name,
+      sku,
+      category || null,
+      industry || null,
+      description || null,
+      technical_specs ? JSON.stringify(technical_specs) : null,
+      price_range || null,
+      image_url || null,
+      now,
+      now
+    ).run()
+
+    return c.json({
+      success: true,
+      id,
+      message: 'Product created successfully'
+    }, 201)
   } catch (error) {
+    console.error('Product create error:', error)
     return c.json({ error: 'Failed to create product' }, 500)
+  }
+})
+
+// PUT /api/products/:id - Update product
+app.put('/api/products/:id', async (c) => {
+  try {
+    const id = c.req.param('id')
+    const body = await c.req.json()
+
+    // Check if product exists
+    const existing = await c.env.DB.prepare(
+      'SELECT id FROM products WHERE id = ? AND deleted_at IS NULL'
+    ).bind(id).first()
+
+    if (!existing) {
+      return c.json({ error: 'Product not found' }, 404)
+    }
+
+    const now = new Date().toISOString()
+
+    // Build update query dynamically
+    const updates: string[] = []
+    const values: any[] = []
+
+    if (body.name !== undefined) {
+      updates.push('name = ?')
+      values.push(body.name)
+    }
+    if (body.sku !== undefined) {
+      updates.push('sku = ?')
+      values.push(body.sku)
+    }
+    if (body.category !== undefined) {
+      updates.push('category = ?')
+      values.push(body.category)
+    }
+    if (body.industry !== undefined) {
+      updates.push('industry = ?')
+      values.push(body.industry)
+    }
+    if (body.description !== undefined) {
+      updates.push('description = ?')
+      values.push(body.description)
+    }
+    if (body.technical_specs !== undefined) {
+      updates.push('technical_specs = ?')
+      values.push(JSON.stringify(body.technical_specs))
+    }
+    if (body.price_range !== undefined) {
+      updates.push('price_range = ?')
+      values.push(body.price_range)
+    }
+    if (body.image_url !== undefined) {
+      updates.push('image_url = ?')
+      values.push(body.image_url)
+    }
+    if (body.is_active !== undefined) {
+      updates.push('is_active = ?')
+      values.push(body.is_active ? 1 : 0)
+    }
+
+    if (updates.length === 0) {
+      return c.json({ error: 'No fields to update' }, 400)
+    }
+
+    updates.push('updated_at = ?')
+    values.push(now)
+    values.push(id)
+
+    await c.env.DB.prepare(
+      `UPDATE products SET ${updates.join(', ')} WHERE id = ?`
+    ).bind(...values).run()
+
+    return c.json({
+      success: true,
+      message: 'Product updated successfully'
+    })
+  } catch (error) {
+    console.error('Product update error:', error)
+    return c.json({ error: 'Failed to update product' }, 500)
+  }
+})
+
+// DELETE /api/products/:id - Soft delete product
+app.delete('/api/products/:id', async (c) => {
+  try {
+    const id = c.req.param('id')
+
+    // Check if product exists
+    const existing = await c.env.DB.prepare(
+      'SELECT id FROM products WHERE id = ? AND deleted_at IS NULL'
+    ).bind(id).first()
+
+    if (!existing) {
+      return c.json({ error: 'Product not found' }, 404)
+    }
+
+    const now = new Date().toISOString()
+
+    // Soft delete by setting deleted_at
+    await c.env.DB.prepare(
+      'UPDATE products SET deleted_at = ?, updated_at = ? WHERE id = ?'
+    ).bind(now, now, id).run()
+
+    return c.json({
+      success: true,
+      message: 'Product deleted successfully'
+    })
+  } catch (error) {
+    console.error('Product delete error:', error)
+    return c.json({ error: 'Failed to delete product' }, 500)
+  }
+})
+
+// POST /api/products/:id/image - Upload product image to R2
+app.post('/api/products/:id/image', async (c) => {
+  try {
+    const id = c.req.param('id')
+
+    // Check if product exists
+    const existing = await c.env.DB.prepare(
+      'SELECT id FROM products WHERE id = ? AND deleted_at IS NULL'
+    ).bind(id).first()
+
+    if (!existing) {
+      return c.json({ error: 'Product not found' }, 404)
+    }
+
+    // Check if R2 bucket is configured
+    if (!c.env.PRODUCTS_BUCKET) {
+      return c.json({ error: 'R2 storage not configured' }, 500)
+    }
+
+    // Get the form data
+    const formData = await c.req.formData()
+    const file = formData.get('image') as File | null
+
+    if (!file) {
+      return c.json({ error: 'No image file provided' }, 400)
+    }
+
+    // Validate file type
+    const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/gif']
+    if (!allowedTypes.includes(file.type)) {
+      return c.json({ error: 'Invalid file type. Allowed: JPEG, PNG, WebP, GIF' }, 400)
+    }
+
+    // Validate file size (max 10MB)
+    const maxSize = 10 * 1024 * 1024 // 10MB
+    if (file.size > maxSize) {
+      return c.json({ error: 'File size exceeds 10MB limit' }, 400)
+    }
+
+    // Generate unique filename
+    const ext = file.name.split('.').pop() || 'jpg'
+    const filename = `products/${id}/${crypto.randomUUID()}.${ext}`
+
+    // Upload to R2
+    await c.env.PRODUCTS_BUCKET.put(filename, file.stream(), {
+      httpMetadata: {
+        contentType: file.type,
+      },
+      customMetadata: {
+        productId: id,
+        uploadedAt: new Date().toISOString(),
+      },
+    })
+
+    // Generate public URL (assuming public bucket or custom domain)
+    // For now, store the R2 key; in production, you'd use a custom domain or signed URL
+    const imageUrl = `/api/products/${id}/image/file/${filename.split('/').pop()}`
+
+    // Update product with image URL
+    const now = new Date().toISOString()
+    await c.env.DB.prepare(
+      'UPDATE products SET image_url = ?, updated_at = ? WHERE id = ?'
+    ).bind(imageUrl, now, id).run()
+
+    return c.json({
+      success: true,
+      message: 'Image uploaded successfully',
+      imageUrl,
+      key: filename
+    })
+  } catch (error) {
+    console.error('Image upload error:', error)
+    return c.json({ error: 'Failed to upload image' }, 500)
   }
 })
 
