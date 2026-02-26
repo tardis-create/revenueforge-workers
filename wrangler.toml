@@ -18,6 +18,11 @@ JWT_SECRET = "change-me-in-production-use-wrangler-secret"
 RESEND_FROM_EMAIL = "RevenueForge <notifications@revenueforge.com>"
 NOTIFICATION_EMAIL_TO = "admin@revenueforge.com"
 
+# R2 bucket for product images
+[[r2_buckets]]
+binding = "PRODUCT_IMAGES"
+bucket_name = "revenueforge-product-images"
+
 # Secrets (set via wrangler secret put)
 # RESEND_API_KEY
 # TWILIO_ACCOUNT_SID
