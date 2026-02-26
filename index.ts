@@ -1556,6 +1556,847 @@ app.patch('/api/quotes/:id/items/:item_id', async (c) => {
   }
 })
 
+// ============ EMAIL TEMPLATES ROUTES (RF-B06) ============
+
+// GET /api/email-templates - List all templates
+app.get('/api/email-templates', authMiddleware, async (c) => {
+  try {
+    const type = c.req.query('type')
+    const activeOnly = c.req.query('active_only') === 'true'
+    
+    let query = 'SELECT * FROM email_templates'
+    const conditions: string[] = []
+    const params: any[] = []
+    
+    if (type) {
+      conditions.push('type = ?')
+      params.push(type)
+    }
+    if (activeOnly) {
+      conditions.push('is_active = 1')
+    }
+    
+    if (conditions.length > 0) {
+      query += ' WHERE ' + conditions.join(' AND ')
+    }
+    query += ' ORDER BY created_at DESC'
+    
+    const { results } = await c.env.DB.prepare(query).bind(...params).all()
+    return c.json({ success: true, data: results })
+  } catch (error) {
+    console.error('Fetch email templates error:', error)
+    return c.json({ error: 'Failed to fetch email templates' }, 500)
+  }
+})
+
+// GET /api/email-templates/:id - Single template
+app.get('/api/email-templates/:id', authMiddleware, async (c) => {
+  try {
+    const id = c.req.param('id')
+    const template = await c.env.DB.prepare(
+      'SELECT * FROM email_templates WHERE id = ?'
+    ).bind(id).first()
+    
+    if (!template) {
+      return c.json({ error: 'Template not found' }, 404)
+    }
+    
+    return c.json({ success: true, data: template })
+  } catch (error) {
+    console.error('Fetch email template error:', error)
+    return c.json({ error: 'Failed to fetch email template' }, 500)
+  }
+})
+
+// POST /api/email-templates - Create template
+app.post('/api/email-templates', authMiddleware, async (c) => {
+  try {
+    const body = await c.req.json()
+    const { name, subject, body: templateBody, type, variables } = body
+    
+    if (!name || !subject || !templateBody) {
+      return c.json({ error: 'Name, subject, and body are required' }, 400)
+    }
+    
+    const id = 'tpl_' + crypto.randomUUID().replace(/-/g, '').substring(0, 16)
+    const now = new Date().toISOString()
+    
+    await c.env.DB.prepare(`
+      INSERT INTO email_templates (id, name, subject, body, type, variables, is_active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+    `).bind(
+      id,
+      name,
+      subject,
+      templateBody,
+      type || 'general',
+      variables ? JSON.stringify(variables) : null,
+      now,
+      now
+    ).run()
+    
+    return c.json({
+      success: true,
+      message: 'Template created successfully',
+      data: { id, name, subject, type }
+    }, 201)
+  } catch (error) {
+    console.error('Create email template error:', error)
+    return c.json({ error: 'Failed to create email template' }, 500)
+  }
+})
+
+// PATCH /api/email-templates/:id - Update template
+app.patch('/api/email-templates/:id', authMiddleware, async (c) => {
+  try {
+    const id = c.req.param('id')
+    const body = await c.req.json()
+    const { name, subject, body: templateBody, type, variables, is_active } = body
+    
+    // Check if template exists
+    const existing = await c.env.DB.prepare(
+      'SELECT id FROM email_templates WHERE id = ?'
+    ).bind(id).first()
+    
+    if (!existing) {
+      return c.json({ error: 'Template not found' }, 404)
+    }
+    
+    const updates: string[] = []
+    const params: any[] = []
+    
+    if (name !== undefined) {
+      updates.push('name = ?')
+      params.push(name)
+    }
+    if (subject !== undefined) {
+      updates.push('subject = ?')
+      params.push(subject)
+    }
+    if (templateBody !== undefined) {
+      updates.push('body = ?')
+      params.push(templateBody)
+    }
+    if (type !== undefined) {
+      updates.push('type = ?')
+      params.push(type)
+    }
+    if (variables !== undefined) {
+      updates.push('variables = ?')
+      params.push(variables ? JSON.stringify(variables) : null)
+    }
+    if (is_active !== undefined) {
+      updates.push('is_active = ?')
+      params.push(is_active ? 1 : 0)
+    }
+    
+    if (updates.length === 0) {
+      return c.json({ error: 'No fields to update' }, 400)
+    }
+    
+    updates.push('updated_at = ?')
+    params.push(new Date().toISOString())
+    params.push(id)
+    
+    await c.env.DB.prepare(
+      `UPDATE email_templates SET ${updates.join(', ')} WHERE id = ?`
+    ).bind(...params).run()
+    
+    return c.json({ success: true, message: 'Template updated successfully' })
+  } catch (error) {
+    console.error('Update email template error:', error)
+    return c.json({ error: 'Failed to update email template' }, 500)
+  }
+})
+
+// DELETE /api/email-templates/:id - Delete template
+app.delete('/api/email-templates/:id', authMiddleware, async (c) => {
+  try {
+    const id = c.req.param('id')
+    
+    const result = await c.env.DB.prepare(
+      'DELETE FROM email_templates WHERE id = ?'
+    ).bind(id).run()
+    
+    const meta = result.meta as { changes?: number }
+    if (!meta?.changes) {
+      return c.json({ error: 'Template not found' }, 404)
+    }
+    
+    return c.json({ success: true, message: 'Template deleted successfully' })
+  } catch (error) {
+    console.error('Delete email template error:', error)
+    return c.json({ error: 'Failed to delete email template' }, 500)
+  }
+})
+
+// ============ DEALERS ROUTES (RF-B08) ============
+
+// GET /api/dealers - List all dealers with pagination
+app.get('/api/dealers', authMiddleware, async (c) => {
+  try {
+    const page = parseInt(c.req.query('page') || '1')
+    const limit = parseInt(c.req.query('limit') || '20')
+    const offset = (page - 1) * limit
+    const status = c.req.query('status')
+    const search = c.req.query('search')
+    
+    // Build query
+    let whereConditions: string[] = ['deleted_at IS NULL']
+    const params: any[] = []
+    
+    if (status) {
+      whereConditions.push('status = ?')
+      params.push(status)
+    }
+    
+    if (search) {
+      whereConditions.push('(name LIKE ? OR email LIKE ? OR company LIKE ?)')
+      const searchTerm = `%${search}%`
+      params.push(searchTerm, searchTerm, searchTerm)
+    }
+    
+    const whereClause = 'WHERE ' + whereConditions.join(' AND ')
+    
+    // Get total count
+    const countResult = await c.env.DB.prepare(
+      `SELECT COUNT(*) as total FROM dealers ${whereClause}`
+    ).bind(...params).first() as any
+    const total = countResult?.total || 0
+    
+    // Get paginated results
+    const { results } = await c.env.DB.prepare(
+      `SELECT * FROM dealers ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`
+    ).bind(...params, limit, offset).all()
+    
+    return c.json({
+      success: true,
+      data: results,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
+    })
+  } catch (error) {
+    console.error('Fetch dealers error:', error)
+    return c.json({ error: 'Failed to fetch dealers' }, 500)
+  }
+})
+
+// GET /api/dealers/:id - Single dealer with stats
+app.get('/api/dealers/:id', authMiddleware, async (c) => {
+  try {
+    const id = c.req.param('id')
+    
+    const dealer = await c.env.DB.prepare(
+      'SELECT * FROM dealers WHERE id = ? AND deleted_at IS NULL'
+    ).bind(id).first()
+    
+    if (!dealer) {
+      return c.json({ error: 'Dealer not found' }, 404)
+    }
+    
+    // Get stats
+    const [leadsCount, ordersCount, revenueResult] = await Promise.all([
+      c.env.DB.prepare('SELECT COUNT(*) as count FROM leads WHERE dealer_id = ?').bind(id).first() as Promise<any>,
+      c.env.DB.prepare('SELECT COUNT(*) as count FROM dealer_orders WHERE dealer_id = ?').bind(id).first() as Promise<any>,
+      c.env.DB.prepare('SELECT COALESCE(SUM(amount), 0) as total FROM dealer_orders WHERE dealer_id = ? AND status = ?').bind(id, 'completed').first() as Promise<any>
+    ])
+    
+    return c.json({
+      success: true,
+      data: {
+        ...dealer,
+        stats: {
+          total_leads: leadsCount?.count || 0,
+          total_orders: ordersCount?.count || 0,
+          total_revenue: revenueResult?.total || 0
+        }
+      }
+    })
+  } catch (error) {
+    console.error('Fetch dealer error:', error)
+    return c.json({ error: 'Failed to fetch dealer' }, 500)
+  }
+})
+
+// POST /api/dealers - Create dealer
+app.post('/api/dealers', authMiddleware, async (c) => {
+  try {
+    const body = await c.req.json()
+    const { name, email, phone, company, territory, commission_rate, notes } = body
+    
+    if (!name) {
+      return c.json({ error: 'Dealer name is required' }, 400)
+    }
+    
+    const id = 'dlr_' + crypto.randomUUID().replace(/-/g, '').substring(0, 16)
+    const now = new Date().toISOString()
+    
+    await c.env.DB.prepare(`
+      INSERT INTO dealers (id, name, email, phone, company, territory, commission_rate, status, notes, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+    `).bind(
+      id,
+      name,
+      email || null,
+      phone || null,
+      company || null,
+      territory || null,
+      commission_rate || 0,
+      notes || null,
+      now,
+      now
+    ).run()
+    
+    return c.json({
+      success: true,
+      message: 'Dealer created successfully',
+      data: { id, name, status: 'active' }
+    }, 201)
+  } catch (error) {
+    console.error('Create dealer error:', error)
+    return c.json({ error: 'Failed to create dealer' }, 500)
+  }
+})
+
+// PATCH /api/dealers/:id - Update dealer
+app.patch('/api/dealers/:id', authMiddleware, async (c) => {
+  try {
+    const id = c.req.param('id')
+    const body = await c.req.json()
+    const { name, email, phone, company, territory, commission_rate, status, notes } = body
+    
+    // Check if dealer exists and is not deleted
+    const existing = await c.env.DB.prepare(
+      'SELECT id FROM dealers WHERE id = ? AND deleted_at IS NULL'
+    ).bind(id).first()
+    
+    if (!existing) {
+      return c.json({ error: 'Dealer not found' }, 404)
+    }
+    
+    const updates: string[] = []
+    const params: any[] = []
+    
+    if (name !== undefined) {
+      updates.push('name = ?')
+      params.push(name)
+    }
+    if (email !== undefined) {
+      updates.push('email = ?')
+      params.push(email)
+    }
+    if (phone !== undefined) {
+      updates.push('phone = ?')
+      params.push(phone)
+    }
+    if (company !== undefined) {
+      updates.push('company = ?')
+      params.push(company)
+    }
+    if (territory !== undefined) {
+      updates.push('territory = ?')
+      params.push(territory)
+    }
+    if (commission_rate !== undefined) {
+      updates.push('commission_rate = ?')
+      params.push(commission_rate)
+    }
+    if (status !== undefined) {
+      updates.push('status = ?')
+      params.push(status)
+    }
+    if (notes !== undefined) {
+      updates.push('notes = ?')
+      params.push(notes)
+    }
+    
+    if (updates.length === 0) {
+      return c.json({ error: 'No fields to update' }, 400)
+    }
+    
+    updates.push('updated_at = ?')
+    params.push(new Date().toISOString())
+    params.push(id)
+    
+    await c.env.DB.prepare(
+      `UPDATE dealers SET ${updates.join(', ')} WHERE id = ?`
+    ).bind(...params).run()
+    
+    return c.json({ success: true, message: 'Dealer updated successfully' })
+  } catch (error) {
+    console.error('Update dealer error:', error)
+    return c.json({ error: 'Failed to update dealer' }, 500)
+  }
+})
+
+// DELETE /api/dealers/:id - Soft-delete dealer
+app.delete('/api/dealers/:id', authMiddleware, async (c) => {
+  try {
+    const id = c.req.param('id')
+    const now = new Date().toISOString()
+    
+    const result = await c.env.DB.prepare(
+      'UPDATE dealers SET deleted_at = ?, status = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL'
+    ).bind(now, 'inactive', now, id).run()
+    
+    const meta = result.meta as { changes?: number }
+    if (!meta?.changes) {
+      return c.json({ error: 'Dealer not found or already deleted' }, 404)
+    }
+    
+    return c.json({ success: true, message: 'Dealer deleted successfully' })
+  } catch (error) {
+    console.error('Delete dealer error:', error)
+    return c.json({ error: 'Failed to delete dealer' }, 500)
+  }
+})
+
+// PATCH /api/dealers/:id/assign - Assign leads/quotes to dealer
+app.patch('/api/dealers/:id/assign', authMiddleware, async (c) => {
+  try {
+    const dealerId = c.req.param('id')
+    const body = await c.req.json()
+    const { lead_ids, quote_ids } = body
+    
+    // Check if dealer exists and is active
+    const dealer = await c.env.DB.prepare(
+      'SELECT id, status FROM dealers WHERE id = ? AND deleted_at IS NULL'
+    ).bind(dealerId).first() as any
+    
+    if (!dealer) {
+      return c.json({ error: 'Dealer not found' }, 404)
+    }
+    
+    if (dealer.status !== 'active') {
+      return c.json({ error: 'Cannot assign to inactive dealer' }, 400)
+    }
+    
+    const results: { leads_updated: number; quotes_updated: number } = {
+      leads_updated: 0,
+      quotes_updated: 0
+    }
+    
+    // Assign leads
+    if (lead_ids && Array.isArray(lead_ids) && lead_ids.length > 0) {
+      for (const leadId of lead_ids) {
+        await c.env.DB.prepare(
+          'UPDATE leads SET dealer_id = ?, updated_at = ? WHERE id = ?'
+        ).bind(dealerId, new Date().toISOString(), leadId).run()
+        results.leads_updated++
+      }
+    }
+    
+    // Assign quotes (if quotes table exists)
+    if (quote_ids && Array.isArray(quote_ids) && quote_ids.length > 0) {
+      try {
+        for (const quoteId of quote_ids) {
+          await c.env.DB.prepare(
+            'UPDATE quotes SET created_by = ?, updated_at = ? WHERE id = ?'
+          ).bind(dealerId, new Date().toISOString(), quoteId).run()
+          results.quotes_updated++
+        }
+      } catch (e) {
+        // Quotes table might not exist
+        console.log('Quotes assignment skipped:', e)
+      }
+    }
+    
+    return c.json({
+      success: true,
+      message: 'Assignment completed',
+      data: results
+    })
+  } catch (error) {
+    console.error('Assign to dealer error:', error)
+    return c.json({ error: 'Failed to assign to dealer' }, 500)
+  }
+})
+
+// GET /api/dealers/:id/stats - Dealer statistics
+app.get('/api/dealers/:id/stats', authMiddleware, async (c) => {
+  try {
+    const id = c.req.param('id')
+    
+    // Verify dealer exists
+    const dealer = await c.env.DB.prepare(
+      'SELECT id FROM dealers WHERE id = ? AND deleted_at IS NULL'
+    ).bind(id).first()
+    
+    if (!dealer) {
+      return c.json({ error: 'Dealer not found' }, 404)
+    }
+    
+    // Get comprehensive stats
+    const [
+      leadsCount,
+      leadsByStatus,
+      ordersCount,
+      ordersByStatus,
+      revenueResult,
+      recentOrders
+    ] = await Promise.all([
+      c.env.DB.prepare('SELECT COUNT(*) as count FROM leads WHERE dealer_id = ?').bind(id).first() as Promise<any>,
+      c.env.DB.prepare('SELECT status, COUNT(*) as count FROM leads WHERE dealer_id = ? GROUP BY status').bind(id).all(),
+      c.env.DB.prepare('SELECT COUNT(*) as count FROM dealer_orders WHERE dealer_id = ?').bind(id).first() as Promise<any>,
+      c.env.DB.prepare('SELECT status, COUNT(*) as count FROM dealer_orders WHERE dealer_id = ? GROUP BY status').bind(id).all(),
+      c.env.DB.prepare('SELECT COALESCE(SUM(amount), 0) as total FROM dealer_orders WHERE dealer_id = ? AND status = ?').bind(id, 'completed').first() as Promise<any>,
+      c.env.DB.prepare('SELECT * FROM dealer_orders WHERE dealer_id = ? ORDER BY order_date DESC LIMIT 10').bind(id).all()
+    ])
+    
+    return c.json({
+      success: true,
+      data: {
+        leads: {
+          total: leadsCount?.count || 0,
+          by_status: leadsByStatus.results || []
+        },
+        orders: {
+          total: ordersCount?.count || 0,
+          by_status: ordersByStatus.results || [],
+          recent: recentOrders.results || []
+        },
+        revenue: {
+          total: revenueResult?.total || 0
+        }
+      }
+    })
+  } catch (error) {
+    console.error('Fetch dealer stats error:', error)
+    return c.json({ error: 'Failed to fetch dealer statistics' }, 500)
+  }
+})
+
+// ============ USERS/RBAC ROUTES (RF-B09) ============
+
+// RBAC middleware - checks if user has required role
+function requireRole(...allowedRoles: string[]) {
+  return async (c: any, next: () => Promise<void>) => {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Authentication required' }, 401)
+    }
+    
+    if (!allowedRoles.includes(user.role)) {
+      return c.json({ error: 'Insufficient permissions' }, 403)
+    }
+    
+    await next()
+  }
+}
+
+// GET /api/users - List users (admin only)
+app.get('/api/users', authMiddleware, requireRole('admin'), async (c) => {
+  try {
+    const page = parseInt(c.req.query('page') || '1')
+    const limit = parseInt(c.req.query('limit') || '20')
+    const offset = (page - 1) * limit
+    const role = c.req.query('role')
+    const search = c.req.query('search')
+    const includeInactive = c.req.query('include_inactive') === 'true'
+    
+    // Build query
+    let whereConditions: string[] = []
+    const params: any[] = []
+    
+    if (!includeInactive) {
+      whereConditions.push('is_active = 1')
+    }
+    
+    if (role) {
+      whereConditions.push('role = ?')
+      params.push(role)
+    }
+    
+    if (search) {
+      whereConditions.push('(email LIKE ? OR first_name LIKE ? OR last_name LIKE ?)')
+      const searchTerm = `%${search}%`
+      params.push(searchTerm, searchTerm, searchTerm)
+    }
+    
+    const whereClause = whereConditions.length > 0 
+      ? 'WHERE ' + whereConditions.join(' AND ')
+      : ''
+    
+    // Get total count
+    const countResult = await c.env.DB.prepare(
+      `SELECT COUNT(*) as total FROM users ${whereClause}`
+    ).bind(...params).first() as any
+    const total = countResult?.total || 0
+    
+    // Get paginated results (exclude password_hash)
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, email, first_name, last_name, role, phone, is_active, last_login_at, created_at, updated_at 
+       FROM users ${whereClause} 
+       ORDER BY created_at DESC 
+       LIMIT ? OFFSET ?`
+    ).bind(...params, limit, offset).all()
+    
+    return c.json({
+      success: true,
+      data: results,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
+    })
+  } catch (error) {
+    console.error('Fetch users error:', error)
+    return c.json({ error: 'Failed to fetch users' }, 500)
+  }
+})
+
+// GET /api/users/:id - Single user
+app.get('/api/users/:id', authMiddleware, async (c) => {
+  try {
+    const userId = c.req.param('id')
+    const currentUser = c.get('user')
+    
+    // Users can only view their own profile unless they're admin
+    if (currentUser.user_id !== userId && currentUser.role !== 'admin') {
+      return c.json({ error: 'Insufficient permissions' }, 403)
+    }
+    
+    const user = await c.env.DB.prepare(`
+      SELECT id, email, first_name, last_name, role, phone, is_active, last_login_at, created_at, updated_at
+      FROM users WHERE id = ?
+    `).bind(userId).first()
+    
+    if (!user) {
+      return c.json({ error: 'User not found' }, 404)
+    }
+    
+    return c.json({ success: true, data: user })
+  } catch (error) {
+    console.error('Fetch user error:', error)
+    return c.json({ error: 'Failed to fetch user' }, 500)
+  }
+})
+
+// POST /api/users - Create user (admin only)
+app.post('/api/users', authMiddleware, requireRole('admin'), async (c) => {
+  try {
+    const body = await c.req.json()
+    const { email, password, first_name, last_name, role, phone } = body
+    
+    // Validation
+    if (!email || !password) {
+      return c.json({ error: 'Email and password are required' }, 400)
+    }
+    
+    if (password.length < 6) {
+      return c.json({ error: 'Password must be at least 6 characters' }, 400)
+    }
+    
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+    if (!emailRegex.test(email)) {
+      return c.json({ error: 'Invalid email format' }, 400)
+    }
+    
+    // Validate role
+    const validRoles = ['admin', 'dealer', 'staff', 'user']
+    const userRole = role || 'user'
+    if (!validRoles.includes(userRole)) {
+      return c.json({ error: `Invalid role. Must be one of: ${validRoles.join(', ')}` }, 400)
+    }
+    
+    // Check if user exists
+    const existing = await c.env.DB.prepare(
+      'SELECT id FROM users WHERE email = ?'
+    ).bind(email.toLowerCase()).first()
+    
+    if (existing) {
+      return c.json({ error: 'User with this email already exists' }, 409)
+    }
+    
+    // Create user
+    const passwordHash = await bcrypt.hash(password, 10)
+    const id = 'usr_' + crypto.randomUUID().replace(/-/g, '').substring(0, 16)
+    const now = new Date().toISOString()
+    
+    await c.env.DB.prepare(`
+      INSERT INTO users (id, email, password_hash, first_name, last_name, role, phone, is_active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    `).bind(
+      id,
+      email.toLowerCase(),
+      passwordHash,
+      first_name || null,
+      last_name || null,
+      userRole,
+      phone || null,
+      now,
+      now
+    ).run()
+    
+    return c.json({
+      success: true,
+      message: 'User created successfully',
+      data: {
+        id,
+        email: email.toLowerCase(),
+        first_name,
+        last_name,
+        role: userRole
+      }
+    }, 201)
+  } catch (error) {
+    console.error('Create user error:', error)
+    return c.json({ error: 'Failed to create user' }, 500)
+  }
+})
+
+// PATCH /api/users/:id - Update user
+app.patch('/api/users/:id', authMiddleware, async (c) => {
+  try {
+    const userId = c.req.param('id')
+    const body = await c.req.json()
+    const currentUser = c.get('user')
+    
+    // Users can update their own profile, admins can update anyone
+    const isSelfUpdate = currentUser.user_id === userId
+    const isAdmin = currentUser.role === 'admin'
+    
+    if (!isSelfUpdate && !isAdmin) {
+      return c.json({ error: 'Insufficient permissions' }, 403)
+    }
+    
+    // Non-admins cannot change role
+    if (body.role !== undefined && !isAdmin) {
+      return c.json({ error: 'Only admins can change user roles' }, 403)
+    }
+    
+    const { first_name, last_name, phone, password } = body
+    
+    // Check user exists
+    const existing = await c.env.DB.prepare(
+      'SELECT id FROM users WHERE id = ?'
+    ).bind(userId).first()
+    
+    if (!existing) {
+      return c.json({ error: 'User not found' }, 404)
+    }
+    
+    const updates: string[] = []
+    const params: any[] = []
+    
+    if (first_name !== undefined) {
+      updates.push('first_name = ?')
+      params.push(first_name)
+    }
+    if (last_name !== undefined) {
+      updates.push('last_name = ?')
+      params.push(last_name)
+    }
+    if (phone !== undefined) {
+      updates.push('phone = ?')
+      params.push(phone)
+    }
+    if (password !== undefined) {
+      if (password.length < 6) {
+        return c.json({ error: 'Password must be at least 6 characters' }, 400)
+      }
+      const passwordHash = await bcrypt.hash(password, 10)
+      updates.push('password_hash = ?')
+      params.push(passwordHash)
+    }
+    
+    if (updates.length === 0) {
+      return c.json({ error: 'No fields to update' }, 400)
+    }
+    
+    updates.push('updated_at = ?')
+    params.push(new Date().toISOString())
+    params.push(userId)
+    
+    await c.env.DB.prepare(
+      `UPDATE users SET ${updates.join(', ')} WHERE id = ?`
+    ).bind(...params).run()
+    
+    return c.json({ success: true, message: 'User updated successfully' })
+  } catch (error) {
+    console.error('Update user error:', error)
+    return c.json({ error: 'Failed to update user' }, 500)
+  }
+})
+
+// DELETE /api/users/:id - Deactivate user
+app.delete('/api/users/:id', authMiddleware, requireRole('admin'), async (c) => {
+  try {
+    const userId = c.req.param('id')
+    const currentUser = c.get('user')
+    
+    // Prevent self-deactivation
+    if (currentUser.user_id === userId) {
+      return c.json({ error: 'Cannot deactivate your own account' }, 400)
+    }
+    
+    const now = new Date().toISOString()
+    const result = await c.env.DB.prepare(
+      'UPDATE users SET is_active = 0, updated_at = ? WHERE id = ? AND is_active = 1'
+    ).bind(now, userId).run()
+    
+    const meta = result.meta as { changes?: number }
+    if (!meta?.changes) {
+      return c.json({ error: 'User not found or already deactivated' }, 404)
+    }
+    
+    return c.json({ success: true, message: 'User deactivated successfully' })
+  } catch (error) {
+    console.error('Deactivate user error:', error)
+    return c.json({ error: 'Failed to deactivate user' }, 500)
+  }
+})
+
+// PATCH /api/users/:id/role - Change user role (admin only)
+app.patch('/api/users/:id/role', authMiddleware, requireRole('admin'), async (c) => {
+  try {
+    const userId = c.req.param('id')
+    const body = await c.req.json()
+    const { role } = body
+    const currentUser = c.get('user')
+    
+    // Validate role
+    const validRoles = ['admin', 'dealer', 'staff', 'user']
+    if (!role || !validRoles.includes(role)) {
+      return c.json({ error: `Invalid role. Must be one of: ${validRoles.join(', ')}` }, 400)
+    }
+    
+    // Prevent self-role-change (admin demoting themselves)
+    if (currentUser.user_id === userId) {
+      return c.json({ error: 'Cannot change your own role' }, 400)
+    }
+    
+    // Check user exists
+    const existing = await c.env.DB.prepare(
+      'SELECT id, role FROM users WHERE id = ?'
+    ).bind(userId).first() as any
+    
+    if (!existing) {
+      return c.json({ error: 'User not found' }, 404)
+    }
+    
+    const now = new Date().toISOString()
+    await c.env.DB.prepare(
+      'UPDATE users SET role = ?, updated_at = ? WHERE id = ?'
+    ).bind(role, now, userId).run()
+    
+    return c.json({
+      success: true,
+      message: 'User role updated successfully',
+      data: { previous_role: existing.role, new_role: role }
+    })
+  } catch (error) {
+    console.error('Change user role error:', error)
+    return c.json({ error: 'Failed to change user role' }, 500)
+  }
+})
+
 // Daily summary report
 app.get('/api/reports/daily-summary', async (c) => {
   try {
