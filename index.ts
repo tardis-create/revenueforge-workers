@@ -21,19 +21,22 @@ const app = new Hono<{ Bindings: Bindings }>()
 // In-memory rate limiting: Map<email, { count: number, resetAt: number }>
 const loginAttempts = new Map<string, { count: number; resetAt: number }>()
 
-// Clean up old rate limit entries periodically
-setInterval(() => {
-  const now = Date.now()
-  for (const [email, data] of loginAttempts) {
-    if (data.resetAt < now) {
-      loginAttempts.delete(email)
-    }
-  }
-}, 60000) // Clean every minute
-
 // Check rate limit for login (5 attempts per minute)
+// Also performs lazy cleanup of expired entries
 function checkRateLimit(email: string): { allowed: boolean; remaining: number; resetIn: number } {
   const now = Date.now()
+  
+  // Lazy cleanup: remove expired entries (limit cleanup to avoid performance impact)
+  let cleaned = 0
+  for (const [key, data] of loginAttempts) {
+    if (data.resetAt < now) {
+      loginAttempts.delete(key)
+      cleaned++
+      // Only clean up to 10 entries per check to avoid performance issues
+      if (cleaned >= 10) break
+    }
+  }
+  
   const record = loginAttempts.get(email)
   
   if (!record || record.resetAt < now) {
