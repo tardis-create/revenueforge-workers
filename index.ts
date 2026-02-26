@@ -556,16 +556,79 @@ app.post('/api/products', async (c) => {
   }
 })
 
-// RFQ with email notification
+// RFQ with email notification and auto-lead creation
 app.post('/api/rfq', async (c) => {
   try {
     const body = await c.req.json()
-    const id = crypto.randomUUID()
+    const rfqId = crypto.randomUUID()
     const now = new Date().toISOString()
     
-    await c.env.DB.prepare(
-      'INSERT INTO rfq_submissions (id, company_name, contact_name, email, phone, service_type, project_description, estimated_budget, timeline, status, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-    ).bind(id, body.company_name, body.contact_name, body.email, body.phone, body.service_type, body.project_description, body.estimated_budget, body.timeline, 'new', body.additional_notes || null, now, now).run()
+    // 9. Auto-create lead from RFQ submission
+    const leadId = crypto.randomUUID()
+    let estimatedValue = 0
+    
+    // Parse estimated budget to numeric value
+    if (body.estimated_budget) {
+      const budgetStr = String(body.estimated_budget).replace(/[^0-9.-]/g, '')
+      estimatedValue = parseFloat(budgetStr) || 0
+    }
+    
+    // Create lead from RFQ
+    await c.env.DB.prepare(`
+      INSERT INTO leads (
+        id, company_name, contact_name, email, phone, 
+        status, source, estimated_value, notes, 
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      leadId,
+      body.company_name || null,
+      body.contact_name || null,
+      body.email || null,
+      body.phone || null,
+      'new',
+      'rfq',
+      estimatedValue,
+      body.project_description || null,
+      now,
+      now
+    ).run()
+    
+    // Create initial lead activity
+    await c.env.DB.prepare(`
+      INSERT INTO lead_activities (id, lead_id, type, description, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).bind(
+      crypto.randomUUID(),
+      leadId,
+      'created',
+      'Lead auto-created from RFQ submission',
+      now
+    ).run()
+    
+    // Create RFQ submission with lead link
+    await c.env.DB.prepare(`
+      INSERT INTO rfq_submissions (
+        id, company_name, contact_name, email, phone, 
+        service_type, project_description, estimated_budget, timeline, 
+        status, notes, lead_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      rfqId, 
+      body.company_name, 
+      body.contact_name, 
+      body.email, 
+      body.phone, 
+      body.service_type, 
+      body.project_description, 
+      body.estimated_budget, 
+      body.timeline, 
+      'new', 
+      body.additional_notes || null,
+      leadId,
+      now, 
+      now
+    ).run()
 
     // Send confirmation email to customer
     if (body.email) {
@@ -599,7 +662,8 @@ app.post('/api/rfq', async (c) => {
         <p>A new RFQ has been submitted and requires your attention.</p>
         <h3>Details:</h3>
         <ul>
-          <li><strong>ID:</strong> ${id}</li>
+          <li><strong>RFQ ID:</strong> ${rfqId}</li>
+          <li><strong>Lead ID:</strong> ${leadId}</li>
           <li><strong>Company:</strong> ${body.company_name || 'N/A'}</li>
           <li><strong>Contact:</strong> ${body.contact_name || 'N/A'}</li>
           <li><strong>Email:</strong> ${body.email || 'N/A'}</li>
@@ -610,6 +674,7 @@ app.post('/api/rfq', async (c) => {
         </ul>
         <h3>Project Description:</h3>
         <p>${body.project_description || 'No description provided'}</p>
+        <p><strong>Note:</strong> A new lead has been automatically created from this RFQ.</p>
         <p><a href="https://revenueforge.pronitopenclaw.workers.dev/admin/rfq">View in Dashboard</a></p>
       `
       
@@ -621,55 +686,493 @@ app.post('/api/rfq', async (c) => {
       )
     }
 
-    return c.json({ success: true, id, message: 'RFQ submitted successfully' })
+    return c.json({ 
+      success: true, 
+      id: rfqId, 
+      lead_id: leadId,
+      message: 'RFQ submitted successfully and lead created' 
+    })
   } catch (error) {
     console.error('RFQ error:', error)
     return c.json({ error: 'Failed to submit RFQ' }, 500)
   }
 })
 
-// Leads (CRM)
+// ============ LEADS/CRM ROUTES ============
+
+// 1. GET /api/leads - Paginated list with filters (status, dealer, date range)
 app.get('/api/leads', async (c) => {
   try {
-    const { results } = await c.env.DB.prepare('SELECT * FROM leads ORDER BY created_at DESC').all()
-    return c.json({ leads: results })
+    const page = parseInt(c.req.query('page') || '1')
+    const limit = parseInt(c.req.query('limit') || '50')
+    const offset = (page - 1) * limit
+    
+    const status = c.req.query('status')
+    const dealerId = c.req.query('dealer') || c.req.query('dealer_id')
+    const assignedTo = c.req.query('assigned_to')
+    const startDate = c.req.query('start_date')
+    const endDate = c.req.query('end_date')
+    const search = c.req.query('search')
+    
+    // Build query with filters
+    let whereConditions = ['deleted_at IS NULL']
+    let params: any[] = []
+    
+    if (status) {
+      whereConditions.push('status = ?')
+      params.push(status)
+    }
+    
+    if (dealerId) {
+      whereConditions.push('(dealer_id = ? OR assigned_to = ?)')
+      params.push(dealerId, dealerId)
+    } else if (assignedTo) {
+      whereConditions.push('assigned_to = ?')
+      params.push(assignedTo)
+    }
+    
+    if (startDate) {
+      whereConditions.push('created_at >= ?')
+      params.push(startDate)
+    }
+    
+    if (endDate) {
+      whereConditions.push('created_at <= ?')
+      params.push(endDate)
+    }
+    
+    if (search) {
+      whereConditions.push('(company_name LIKE ? OR contact_name LIKE ? OR email LIKE ?)')
+      const searchTerm = `%${search}%`
+      params.push(searchTerm, searchTerm, searchTerm)
+    }
+    
+    const whereClause = whereConditions.join(' AND ')
+    
+    // Get total count
+    const countQuery = `SELECT COUNT(*) as total FROM leads WHERE ${whereClause}`
+    const countResult = await c.env.DB.prepare(countQuery).bind(...params).first() as any
+    const total = countResult?.total || 0
+    
+    // Get paginated results
+    const dataQuery = `SELECT * FROM leads WHERE ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`
+    const { results } = await c.env.DB.prepare(dataQuery).bind(...params, limit, offset).all()
+    
+    return c.json({
+      success: true,
+      data: results,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
+    })
   } catch (error) {
+    console.error('Fetch leads error:', error)
     return c.json({ error: 'Failed to fetch leads' }, 500)
   }
 })
 
+// 2. GET /api/leads/:id - Single lead with activity history
+app.get('/api/leads/:id', async (c) => {
+  try {
+    const leadId = c.req.param('id')
+    
+    // Get lead details
+    const lead = await c.env.DB.prepare(
+      'SELECT * FROM leads WHERE id = ? AND deleted_at IS NULL'
+    ).bind(leadId).first()
+    
+    if (!lead) {
+      return c.json({ error: 'Lead not found' }, 404)
+    }
+    
+    // Get activity history
+    const { results: activities } = await c.env.DB.prepare(
+      'SELECT * FROM lead_activities WHERE lead_id = ? ORDER BY created_at DESC'
+    ).bind(leadId).all()
+    
+    // Get follow-ups
+    const { results: followUps } = await c.env.DB.prepare(
+      'SELECT * FROM follow_ups WHERE lead_id = ? ORDER BY scheduled_at DESC'
+    ).bind(leadId).all()
+    
+    return c.json({
+      success: true,
+      lead,
+      activities: activities || [],
+      follow_ups: followUps || []
+    })
+  } catch (error) {
+    console.error('Fetch lead error:', error)
+    return c.json({ error: 'Failed to fetch lead' }, 500)
+  }
+})
+
+// 3. POST /api/leads - Create lead (returns 201)
 app.post('/api/leads', async (c) => {
+  try {
+    const body = await c.req.json()
+    
+    // Validate required fields
+    if (!body.company_name && !body.contact_name && !body.email) {
+      return c.json({ error: 'At least one of company_name, contact_name, or email is required' }, 400)
+    }
+    
+    const id = crypto.randomUUID()
+    const now = new Date().toISOString()
+    
+    await c.env.DB.prepare(`
+      INSERT INTO leads (
+        id, company_name, contact_name, email, phone, 
+        status, assigned_to, dealer_id, source, estimated_value, notes, 
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      id,
+      body.company_name || null,
+      body.contact_name || null,
+      body.email || null,
+      body.phone || null,
+      body.status || 'new',
+      body.assigned_to || null,
+      body.dealer_id || body.assigned_to || null,
+      body.source || null,
+      body.estimated_value || 0,
+      body.notes || null,
+      now,
+      now
+    ).run()
+    
+    // Create initial activity
+    await c.env.DB.prepare(`
+      INSERT INTO lead_activities (id, lead_id, type, description, created_at, created_by)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).bind(
+      crypto.randomUUID(),
+      id,
+      'created',
+      'Lead created',
+      now,
+      body.created_by || null
+    ).run()
+    
+    return c.json({
+      success: true,
+      id,
+      message: 'Lead created successfully'
+    }, 201)
+  } catch (error) {
+    console.error('Create lead error:', error)
+    return c.json({ error: 'Failed to create lead' }, 500)
+  }
+})
+
+// 4. PATCH /api/leads/:id - Update lead (status, assignment, etc.)
+app.patch('/api/leads/:id', async (c) => {
+  try {
+    const leadId = c.req.param('id')
+    const body = await c.req.json()
+    
+    // Check if lead exists and is not deleted
+    const existing = await c.env.DB.prepare(
+      'SELECT id FROM leads WHERE id = ? AND deleted_at IS NULL'
+    ).bind(leadId).first()
+    
+    if (!existing) {
+      return c.json({ error: 'Lead not found' }, 404)
+    }
+    
+    const now = new Date().toISOString()
+    const updates: string[] = []
+    const values: any[] = []
+    
+    // Build dynamic update query
+    const allowedFields = ['company_name', 'contact_name', 'email', 'phone', 'status', 
+                          'assigned_to', 'dealer_id', 'source', 'estimated_value', 'notes']
+    
+    for (const field of allowedFields) {
+      if (body[field] !== undefined) {
+        updates.push(`${field} = ?`)
+        values.push(body[field])
+      }
+    }
+    
+    if (updates.length === 0) {
+      return c.json({ error: 'No valid fields to update' }, 400)
+    }
+    
+    updates.push('updated_at = ?')
+    values.push(now)
+    values.push(leadId)
+    
+    await c.env.DB.prepare(
+      `UPDATE leads SET ${updates.join(', ')} WHERE id = ?`
+    ).bind(...values).run()
+    
+    // Create activity for status change
+    if (body.status) {
+      await c.env.DB.prepare(`
+        INSERT INTO lead_activities (id, lead_id, type, description, created_at, created_by)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).bind(
+        crypto.randomUUID(),
+        leadId,
+        'status_change',
+        `Status changed to ${body.status}`,
+        now,
+        body.updated_by || null
+      ).run()
+    }
+    
+    return c.json({
+      success: true,
+      message: 'Lead updated successfully'
+    })
+  } catch (error) {
+    console.error('Update lead error:', error)
+    return c.json({ error: 'Failed to update lead' }, 500)
+  }
+})
+
+// 5. DELETE /api/leads/:id - Soft-delete lead
+app.delete('/api/leads/:id', async (c) => {
+  try {
+    const leadId = c.req.param('id')
+    
+    // Check if lead exists and is not already deleted
+    const existing = await c.env.DB.prepare(
+      'SELECT id FROM leads WHERE id = ? AND deleted_at IS NULL'
+    ).bind(leadId).first()
+    
+    if (!existing) {
+      return c.json({ error: 'Lead not found' }, 404)
+    }
+    
+    const now = new Date().toISOString()
+    
+    // Soft delete
+    await c.env.DB.prepare(
+      'UPDATE leads SET deleted_at = ?, updated_at = ? WHERE id = ?'
+    ).bind(now, now, leadId).run()
+    
+    // Create activity
+    await c.env.DB.prepare(`
+      INSERT INTO lead_activities (id, lead_id, type, description, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).bind(
+      crypto.randomUUID(),
+      leadId,
+      'deleted',
+      'Lead deleted',
+      now
+    ).run()
+    
+    return c.json({
+      success: true,
+      message: 'Lead deleted successfully'
+    })
+  } catch (error) {
+    console.error('Delete lead error:', error)
+    return c.json({ error: 'Failed to delete lead' }, 500)
+  }
+})
+
+// 6. POST /api/leads/:id/activity - Add activity note
+app.post('/api/leads/:id/activity', async (c) => {
+  try {
+    const leadId = c.req.param('id')
+    const body = await c.req.json()
+    
+    // Validate required fields
+    if (!body.type || !body.description) {
+      return c.json({ error: 'Type and description are required' }, 400)
+    }
+    
+    // Check if lead exists and is not deleted
+    const existing = await c.env.DB.prepare(
+      'SELECT id FROM leads WHERE id = ? AND deleted_at IS NULL'
+    ).bind(leadId).first()
+    
+    if (!existing) {
+      return c.json({ error: 'Lead not found' }, 404)
+    }
+    
+    const id = crypto.randomUUID()
+    const now = new Date().toISOString()
+    
+    await c.env.DB.prepare(`
+      INSERT INTO lead_activities (id, lead_id, type, description, created_at, created_by)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).bind(
+      id,
+      leadId,
+      body.type,
+      body.description,
+      now,
+      body.created_by || null
+    ).run()
+    
+    // Update lead's updated_at timestamp
+    await c.env.DB.prepare(
+      'UPDATE leads SET updated_at = ? WHERE id = ?'
+    ).bind(now, leadId).run()
+    
+    return c.json({
+      success: true,
+      id,
+      message: 'Activity added successfully'
+    }, 201)
+  } catch (error) {
+    console.error('Add activity error:', error)
+    return c.json({ error: 'Failed to add activity' }, 500)
+  }
+})
+
+// 7. PATCH /api/leads/:id/assign - Assign to dealer
+app.patch('/api/leads/:id/assign', async (c) => {
+  try {
+    const leadId = c.req.param('id')
+    const body = await c.req.json()
+    
+    // Validate required fields
+    if (!body.dealer_id && !body.assigned_to) {
+      return c.json({ error: 'dealer_id or assigned_to is required' }, 400)
+    }
+    
+    // Check if lead exists and is not deleted
+    const existing = await c.env.DB.prepare(
+      'SELECT id, assigned_to FROM leads WHERE id = ? AND deleted_at IS NULL'
+    ).bind(leadId).first() as any
+    
+    if (!existing) {
+      return c.json({ error: 'Lead not found' }, 404)
+    }
+    
+    const now = new Date().toISOString()
+    const dealerId = body.dealer_id || body.assigned_to
+    const previousAssignee = existing.assigned_to
+    
+    // Update assignment
+    await c.env.DB.prepare(
+      'UPDATE leads SET assigned_to = ?, dealer_id = ?, updated_at = ? WHERE id = ?'
+    ).bind(dealerId, dealerId, now, leadId).run()
+    
+    // Create activity
+    await c.env.DB.prepare(`
+      INSERT INTO lead_activities (id, lead_id, type, description, created_at, created_by)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).bind(
+      crypto.randomUUID(),
+      leadId,
+      'assignment',
+      previousAssignee 
+        ? `Reassigned from ${previousAssignee} to ${dealerId}`
+        : `Assigned to ${dealerId}`,
+      now,
+      body.assigned_by || null
+    ).run()
+    
+    return c.json({
+      success: true,
+      message: 'Lead assigned successfully',
+      assigned_to: dealerId
+    })
+  } catch (error) {
+    console.error('Assign lead error:', error)
+    return c.json({ error: 'Failed to assign lead' }, 500)
+  }
+})
+
+// 8. GET /api/leads/stats - Count per status, total value
+app.get('/api/leads/stats', async (c) => {
+  try {
+    const startDate = c.req.query('start_date')
+    const endDate = c.req.query('end_date')
+    const dealerId = c.req.query('dealer')
+    
+    // Build where clause
+    let whereConditions = ['deleted_at IS NULL']
+    let params: any[] = []
+    
+    if (dealerId) {
+      whereConditions.push('(dealer_id = ? OR assigned_to = ?)')
+      params.push(dealerId, dealerId)
+    }
+    
+    if (startDate) {
+      whereConditions.push('created_at >= ?')
+      params.push(startDate)
+    }
+    
+    if (endDate) {
+      whereConditions.push('created_at <= ?')
+      params.push(endDate)
+    }
+    
+    const whereClause = whereConditions.join(' AND ')
+    
+    // Get counts by status
+    const { results: statusCounts } = await c.env.DB.prepare(
+      `SELECT status, COUNT(*) as count FROM leads WHERE ${whereClause} GROUP BY status`
+    ).bind(...params).all()
+    
+    // Get total value
+    const totalValueResult = await c.env.DB.prepare(
+      `SELECT SUM(estimated_value) as total_value, COUNT(*) as total_count FROM leads WHERE ${whereClause}`
+    ).bind(...params).first() as any
+    
+    // Get average value
+    const avgValueResult = await c.env.DB.prepare(
+      `SELECT AVG(estimated_value) as avg_value FROM leads WHERE ${whereClause} AND estimated_value > 0`
+    ).bind(...params).first() as any
+    
+    // Format status counts
+    const byStatus: Record<string, number> = {}
+    for (const row of (statusCounts || [])) {
+      byStatus[(row as any).status] = (row as any).count
+    }
+    
+    return c.json({
+      success: true,
+      stats: {
+        by_status: byStatus,
+        total_count: totalValueResult?.total_count || 0,
+        total_value: totalValueResult?.total_value || 0,
+        average_value: avgValueResult?.avg_value || 0
+      }
+    })
+  } catch (error) {
+    console.error('Lead stats error:', error)
+    return c.json({ error: 'Failed to get lead stats' }, 500)
+  }
+})
+
+// Legacy endpoint: GET /api/leads/:id/activities (for backward compatibility)
+app.get('/api/leads/:id/activities', async (c) => {
+  try {
+    const { results } = await c.env.DB.prepare(
+      'SELECT * FROM lead_activities WHERE lead_id = ? ORDER BY created_at DESC'
+    ).bind(c.req.param('id')).all()
+    return c.json({ activities: results })
+  } catch (error) {
+    return c.json({ error: 'Failed to fetch activities' }, 500)
+  }
+})
+
+// Legacy endpoint: POST /api/leads/:id/activities (for backward compatibility)
+app.post('/api/leads/:id/activities', async (c) => {
   try {
     const body = await c.req.json()
     const id = crypto.randomUUID()
     const now = new Date().toISOString()
     await c.env.DB.prepare(
-      'INSERT INTO leads (id, company_name, contact_name, email, phone, status, assigned_to, source, estimated_value, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-    ).bind(id, body.company_name, body.contact_name, body.email, body.phone, body.status || 'new', body.assigned_to, body.source, body.estimated_value || 0, body.notes, now, now).run()
+      'INSERT INTO lead_activities (id, lead_id, type, description, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(id, c.req.param('id'), body.type, body.description, now, body.created_by).run()
     return c.json({ success: true, id })
   } catch (error) {
-    return c.json({ error: 'Failed to create lead' }, 500)
-  }
-})
-
-app.get('/api/leads/:id', async (c) => {
-  try {
-    const lead = await c.env.DB.prepare('SELECT * FROM leads WHERE id = ?').bind(c.req.param('id')).first()
-    if (!lead) return c.json({ error: 'Lead not found' }, 404)
-    return c.json({ lead })
-  } catch (error) {
-    return c.json({ error: 'Failed to fetch lead' }, 500)
-  }
-})
-
-app.patch('/api/leads/:id', async (c) => {
-  try {
-    const body = await c.req.json()
-    const now = new Date().toISOString()
-    await c.env.DB.prepare('UPDATE leads SET status = ?, updated_at = ? WHERE id = ?').bind(body.status, now, c.req.param('id')).run()
-    return c.json({ success: true })
-  } catch (error) {
-    return c.json({ error: 'Failed to update lead' }, 500)
+    return c.json({ error: 'Failed to create activity' }, 500)
   }
 })
 
