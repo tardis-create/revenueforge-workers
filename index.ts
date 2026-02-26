@@ -556,6 +556,123 @@ app.post('/api/products', async (c) => {
   }
 })
 
+// GET /api/products/:id - Get single product
+app.get('/api/products/:id', async (c) => {
+  try {
+    const id = c.req.param('id')
+    const product = await c.env.DB.prepare('SELECT * FROM products WHERE id = ?').bind(id).first()
+    
+    if (!product) {
+      return c.json({ error: 'Product not found' }, 404)
+    }
+    
+    return c.json({ success: true, data: product })
+  } catch (error) {
+    return c.json({ error: 'Failed to fetch product' }, 500)
+  }
+})
+
+// PUT /api/products/:id - Update product
+app.put('/api/products/:id', async (c) => {
+  try {
+    const id = c.req.param('id')
+    const body = await c.req.json()
+    const now = new Date().toISOString()
+    
+    // Check if product exists
+    const existing = await c.env.DB.prepare('SELECT id FROM products WHERE id = ?').bind(id).first()
+    if (!existing) {
+      return c.json({ error: 'Product not found' }, 404)
+    }
+    
+    // Update product
+    await c.env.DB.prepare(`
+      UPDATE products 
+      SET name = ?, sku = ?, category = ?, industry = ?, description = ?, 
+          technical_specs = ?, price_range = ?, image_url = ?, is_active = ?, updated_at = ?
+      WHERE id = ?
+    `).bind(
+      body.name, 
+      body.sku, 
+      body.category, 
+      body.industry, 
+      body.description, 
+      body.technical_specs ? JSON.stringify(body.technical_specs) : null,
+      body.price_range,
+      body.image_url,
+      body.is_active !== undefined ? (body.is_active ? 1 : 0) : 1,
+      now,
+      id
+    ).run()
+    
+    return c.json({ success: true, id })
+  } catch (error) {
+    return c.json({ error: 'Failed to update product' }, 500)
+  }
+})
+
+// PATCH /api/products/:id - Partial update product
+app.patch('/api/products/:id', async (c) => {
+  try {
+    const id = c.req.param('id')
+    const body = await c.req.json()
+    const now = new Date().toISOString()
+    
+    // Check if product exists
+    const existing = await c.env.DB.prepare('SELECT * FROM products WHERE id = ?').bind(id).first()
+    if (!existing) {
+      return c.json({ error: 'Product not found' }, 404)
+    }
+    
+    // Build dynamic update query
+    const updates: string[] = []
+    const values: any[] = []
+    
+    if (body.name !== undefined) { updates.push('name = ?'); values.push(body.name) }
+    if (body.sku !== undefined) { updates.push('sku = ?'); values.push(body.sku) }
+    if (body.category !== undefined) { updates.push('category = ?'); values.push(body.category) }
+    if (body.industry !== undefined) { updates.push('industry = ?'); values.push(body.industry) }
+    if (body.description !== undefined) { updates.push('description = ?'); values.push(body.description) }
+    if (body.technical_specs !== undefined) { updates.push('technical_specs = ?'); values.push(JSON.stringify(body.technical_specs)) }
+    if (body.price_range !== undefined) { updates.push('price_range = ?'); values.push(body.price_range) }
+    if (body.image_url !== undefined) { updates.push('image_url = ?'); values.push(body.image_url) }
+    if (body.is_active !== undefined) { updates.push('is_active = ?'); values.push(body.is_active ? 1 : 0) }
+    
+    if (updates.length === 0) {
+      return c.json({ error: 'No fields to update' }, 400)
+    }
+    
+    updates.push('updated_at = ?')
+    values.push(now)
+    values.push(id)
+    
+    await c.env.DB.prepare(`UPDATE products SET ${updates.join(', ')} WHERE id = ?`).bind(...values).run()
+    
+    return c.json({ success: true, id })
+  } catch (error) {
+    return c.json({ error: 'Failed to update product' }, 500)
+  }
+})
+
+// DELETE /api/products/:id - Delete product
+app.delete('/api/products/:id', async (c) => {
+  try {
+    const id = c.req.param('id')
+    
+    // Check if product exists
+    const existing = await c.env.DB.prepare('SELECT id FROM products WHERE id = ?').bind(id).first()
+    if (!existing) {
+      return c.json({ error: 'Product not found' }, 404)
+    }
+    
+    await c.env.DB.prepare('DELETE FROM products WHERE id = ?').bind(id).run()
+    
+    return c.json({ success: true, message: 'Product deleted' })
+  } catch (error) {
+    return c.json({ error: 'Failed to delete product' }, 500)
+  }
+})
+
 // ============ RFQ ROUTES ============
 
 // POST /api/rfq - Create RFQ (public endpoint, no auth required)
