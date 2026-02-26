@@ -556,26 +556,112 @@ app.post('/api/products', async (c) => {
   }
 })
 
-// RFQ with email notification
+// ============ RFQ ROUTES ============
+
+// POST /api/rfq - Create RFQ (public endpoint, no auth required)
 app.post('/api/rfq', async (c) => {
   try {
     const body = await c.req.json()
-    const id = crypto.randomUUID()
+    
+    // Validation: company, contact, email required
+    if (!body.company_name || !body.company_name.trim()) {
+      return c.json({ error: 'Company name is required' }, 400)
+    }
+    if (!body.contact_name || !body.contact_name.trim()) {
+      return c.json({ error: 'Contact name is required' }, 400)
+    }
+    if (!body.email || !body.email.trim()) {
+      return c.json({ error: 'Email is required' }, 400)
+    }
+    
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+    if (!emailRegex.test(body.email)) {
+      return c.json({ error: 'Invalid email format' }, 400)
+    }
+    
+    const rfqId = crypto.randomUUID()
     const now = new Date().toISOString()
     
+    // Auto-create lead from RFQ submission (RF-B03 integration)
+    let leadId: string | null = null
+    try {
+      leadId = crypto.randomUUID()
+      let estimatedValue = 0
+      
+      // Parse estimated budget to numeric value
+      if (body.estimated_budget) {
+        const budgetStr = String(body.estimated_budget).replace(/[^0-9.-]/g, '')
+        estimatedValue = parseFloat(budgetStr) || 0
+      }
+      
+      // Create lead from RFQ
+      await c.env.DB.prepare(`
+        INSERT INTO leads (
+          id, company_name, contact_name, email, phone, 
+          status, source, estimated_value, notes, 
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        leadId,
+        body.company_name.trim(),
+        body.contact_name.trim(),
+        body.email.toLowerCase().trim(),
+        body.phone || null,
+        'new',
+        'rfq',
+        estimatedValue,
+        body.project_description || null,
+        now,
+        now
+      ).run()
+      
+      // Create initial lead activity
+      await c.env.DB.prepare(`
+        INSERT INTO lead_activities (id, lead_id, type, description, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(
+        crypto.randomUUID(),
+        leadId,
+        'created',
+        'Lead auto-created from RFQ submission',
+        now
+      ).run()
+    } catch (leadError) {
+      console.error('Failed to create lead from RFQ:', leadError)
+      // Continue even if lead creation fails - RFQ is still valid
+      leadId = null
+    }
+    
+    // Create RFQ submission with lead link
     await c.env.DB.prepare(
-      'INSERT INTO rfq_submissions (id, company_name, contact_name, email, phone, service_type, project_description, estimated_budget, timeline, status, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-    ).bind(id, body.company_name, body.contact_name, body.email, body.phone, body.service_type, body.project_description, body.estimated_budget, body.timeline, 'new', body.additional_notes || null, now, now).run()
+      'INSERT INTO rfq_submissions (id, company_name, contact_name, email, phone, service_type, project_description, estimated_budget, timeline, status, notes, lead_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).bind(
+      rfqId, 
+      body.company_name.trim(), 
+      body.contact_name.trim(), 
+      body.email.toLowerCase().trim(), 
+      body.phone || null, 
+      body.service_type || null, 
+      body.project_description || null, 
+      body.estimated_budget || null, 
+      body.timeline || null, 
+      'new', 
+      body.additional_notes || null,
+      leadId,
+      now, 
+      now
+    ).run()
 
-    // Send confirmation email to customer
+    // Send confirmation email to customer (non-blocking)
     if (body.email) {
       const emailHtml = `
         <h2>RFQ Received - Thank You!</h2>
-        <p>Dear ${body.contact_name || 'Customer'},</p>
+        <p>Dear ${body.contact_name},</p>
         <p>We have received your Request for Quote. Our team will review your requirements and get back to you within 24-48 hours.</p>
         <h3>RFQ Details:</h3>
         <ul>
-          <li><strong>Company:</strong> ${body.company_name || 'N/A'}</li>
+          <li><strong>Company:</strong> ${body.company_name}</li>
           <li><strong>Service Type:</strong> ${body.service_type || 'N/A'}</li>
           <li><strong>Budget:</strong> ${body.estimated_budget || 'Not specified'}</li>
           <li><strong>Timeline:</strong> ${body.timeline || 'Not specified'}</li>
@@ -589,20 +675,21 @@ app.post('/api/rfq', async (c) => {
         body.email,
         'Your RFQ Has Been Received - RevenueForge',
         emailHtml
-      )
+      ).catch(err => console.error('Failed to send confirmation email:', err))
     }
 
-    // Send notification email to admin
+    // Send notification email to admin (non-blocking)
     if (c.env.NOTIFICATION_EMAIL_TO) {
       const adminHtml = `
         <h2>New RFQ Submitted</h2>
         <p>A new RFQ has been submitted and requires your attention.</p>
         <h3>Details:</h3>
         <ul>
-          <li><strong>ID:</strong> ${id}</li>
-          <li><strong>Company:</strong> ${body.company_name || 'N/A'}</li>
-          <li><strong>Contact:</strong> ${body.contact_name || 'N/A'}</li>
-          <li><strong>Email:</strong> ${body.email || 'N/A'}</li>
+          <li><strong>RFQ ID:</strong> ${rfqId}</li>
+          ${leadId ? `<li><strong>Lead ID:</strong> ${leadId}</li>` : ''}
+          <li><strong>Company:</strong> ${body.company_name}</li>
+          <li><strong>Contact:</strong> ${body.contact_name}</li>
+          <li><strong>Email:</strong> ${body.email}</li>
           <li><strong>Phone:</strong> ${body.phone || 'N/A'}</li>
           <li><strong>Service Type:</strong> ${body.service_type || 'N/A'}</li>
           <li><strong>Budget:</strong> ${body.estimated_budget || 'Not specified'}</li>
@@ -610,21 +697,199 @@ app.post('/api/rfq', async (c) => {
         </ul>
         <h3>Project Description:</h3>
         <p>${body.project_description || 'No description provided'}</p>
+        ${leadId ? '<p><strong>Note:</strong> A new lead has been automatically created from this RFQ.</p>' : ''}
         <p><a href="https://revenueforge.pronitopenclaw.workers.dev/admin/rfq">View in Dashboard</a></p>
       `
       
       await sendEmail(
         c.env,
         c.env.NOTIFICATION_EMAIL_TO,
-        `New RFQ: ${body.company_name} - ${body.service_type}`,
+        `New RFQ: ${body.company_name} - ${body.service_type || 'General'}`,
         adminHtml
-      )
+      ).catch(err => console.error('Failed to send admin notification:', err))
     }
 
-    return c.json({ success: true, id, message: 'RFQ submitted successfully' })
+    return c.json({ 
+      success: true, 
+      id: rfqId, 
+      lead_id: leadId,
+      message: 'RFQ submitted successfully' 
+    }, 201)
   } catch (error) {
     console.error('RFQ error:', error)
     return c.json({ error: 'Failed to submit RFQ' }, 500)
+  }
+})
+
+// GET /api/rfq - Paginated list of RFQs (auth required, admin only)
+app.get('/api/rfq', authMiddleware, async (c) => {
+  try {
+    const page = parseInt(c.req.query('page') || '1')
+    const limit = parseInt(c.req.query('limit') || '50')
+    const offset = (page - 1) * limit
+    
+    const status = c.req.query('status')
+    const startDate = c.req.query('start_date')
+    const endDate = c.req.query('end_date')
+    const search = c.req.query('search')
+    
+    // Build query with filters
+    let whereConditions: string[] = []
+    let params: any[] = []
+    
+    if (status) {
+      whereConditions.push('status = ?')
+      params.push(status)
+    }
+    
+    if (startDate) {
+      whereConditions.push('created_at >= ?')
+      params.push(startDate)
+    }
+    
+    if (endDate) {
+      whereConditions.push('created_at <= ?')
+      params.push(endDate)
+    }
+    
+    if (search) {
+      whereConditions.push('(company_name LIKE ? OR contact_name LIKE ? OR email LIKE ?)')
+      const searchTerm = `%${search}%`
+      params.push(searchTerm, searchTerm, searchTerm)
+    }
+    
+    const whereClause = whereConditions.length > 0 
+      ? 'WHERE ' + whereConditions.join(' AND ')
+      : ''
+    
+    // Get total count
+    const countQuery = `SELECT COUNT(*) as total FROM rfq_submissions ${whereClause}`
+    const countResult = await c.env.DB.prepare(countQuery).bind(...params).first() as any
+    const total = countResult?.total || 0
+    
+    // Get paginated results
+    const dataQuery = `SELECT * FROM rfq_submissions ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`
+    const { results } = await c.env.DB.prepare(dataQuery).bind(...params, limit, offset).all()
+    
+    return c.json({
+      success: true,
+      data: results,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
+    })
+  } catch (error) {
+    console.error('Fetch RFQs error:', error)
+    return c.json({ error: 'Failed to fetch RFQs' }, 500)
+  }
+})
+
+// GET /api/rfq/:id - Single RFQ detail (auth required)
+app.get('/api/rfq/:id', authMiddleware, async (c) => {
+  try {
+    const rfqId = c.req.param('id')
+    
+    // Get RFQ details
+    const rfq = await c.env.DB.prepare(
+      'SELECT * FROM rfq_submissions WHERE id = ?'
+    ).bind(rfqId).first()
+    
+    if (!rfq) {
+      return c.json({ error: 'RFQ not found' }, 404)
+    }
+    
+    // Get associated lead if exists
+    let lead = null
+    if ((rfq as any).lead_id) {
+      lead = await c.env.DB.prepare(
+        'SELECT * FROM leads WHERE id = ?'
+      ).bind((rfq as any).lead_id).first()
+    }
+    
+    return c.json({
+      success: true,
+      rfq,
+      lead
+    })
+  } catch (error) {
+    console.error('Fetch RFQ error:', error)
+    return c.json({ error: 'Failed to fetch RFQ' }, 500)
+  }
+})
+
+// PATCH /api/rfq/:id - Update RFQ status (auth required)
+app.patch('/api/rfq/:id', authMiddleware, async (c) => {
+  try {
+    const rfqId = c.req.param('id')
+    const body = await c.req.json()
+    
+    // Check if RFQ exists
+    const existing = await c.env.DB.prepare(
+      'SELECT id, status, lead_id FROM rfq_submissions WHERE id = ?'
+    ).bind(rfqId).first() as any
+    
+    if (!existing) {
+      return c.json({ error: 'RFQ not found' }, 404)
+    }
+    
+    const now = new Date().toISOString()
+    const updates: string[] = []
+    const values: any[] = []
+    
+    // Valid status transitions: new → reviewed → quoted → closed
+    const validStatuses = ['new', 'reviewed', 'quoted', 'closed']
+    
+    if (body.status) {
+      if (!validStatuses.includes(body.status)) {
+        return c.json({ 
+          error: `Invalid status. Valid statuses: ${validStatuses.join(', ')}` 
+        }, 400)
+      }
+      updates.push('status = ?')
+      values.push(body.status)
+      
+      // Update associated lead status when RFQ is closed
+      if (body.status === 'closed' && existing.lead_id) {
+        await c.env.DB.prepare(
+          'UPDATE leads SET status = ?, updated_at = ? WHERE id = ?'
+        ).bind('closed', now, existing.lead_id).run()
+      }
+    }
+    
+    // Allow updating notes
+    if (body.notes !== undefined) {
+      updates.push('notes = ?')
+      values.push(body.notes)
+    }
+    
+    if (updates.length === 0) {
+      return c.json({ error: 'No valid fields to update' }, 400)
+    }
+    
+    updates.push('updated_at = ?')
+    values.push(now)
+    values.push(rfqId)
+    
+    await c.env.DB.prepare(
+      `UPDATE rfq_submissions SET ${updates.join(', ')} WHERE id = ?`
+    ).bind(...values).run()
+    
+    // Get updated RFQ
+    const updated = await c.env.DB.prepare(
+      'SELECT * FROM rfq_submissions WHERE id = ?'
+    ).bind(rfqId).first()
+    
+    return c.json({
+      success: true,
+      message: 'RFQ updated successfully',
+      rfq: updated
+    })
+  } catch (error) {
+    console.error('Update RFQ error:', error)
+    return c.json({ error: 'Failed to update RFQ' }, 500)
   }
 })
 
