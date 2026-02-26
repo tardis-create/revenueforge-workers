@@ -1,0 +1,26 @@
+name = "revenueforge-api"
+main = "index.ts"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "revenueforge-db"
+database_id = "da0624be-7f9c-4fc7-809a-c79c5641896b"
+
+# Cron triggers for automated notifications
+[[triggers]]
+crons = ["0 9 * * *", "0 */2 * * *"]
+
+# Email configuration (Resend)
+[vars]
+JWT_SECRET = "change-me-in-production-use-wrangler-secret"
+RESEND_FROM_EMAIL = "RevenueForge <notifications@revenueforge.com>"
+NOTIFICATION_EMAIL_TO = "admin@revenueforge.com"
+
+# Secrets (set via wrangler secret put)
+# RESEND_API_KEY
+# TWILIO_ACCOUNT_SID
+# TWILIO_AUTH_TOKEN
+# TWILIO_PHONE_NUMBER
+# ADMIN_WHATSAPP_NUMBER
