@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import { cors } from 'hono/cors'
 import { Resend } from 'resend'
 import { SignJWT, jwtVerify } from 'jose'
 import bcrypt from 'bcryptjs'
@@ -16,6 +17,19 @@ type Bindings = {
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
+
+// Enable CORS for frontend
+app.use('*', cors({
+  origin: [
+    'https://revenueforge.pages.dev',
+    'http://localhost:3000',
+    'http://localhost:3001',
+  ],
+  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization', 'Cookie'],
+  exposeHeaders: ['Set-Cookie'],
+  credentials: true,
+}))
 
 // D1-based rate limiting (5 attempts per 60-second window)
 // Uses Unix timestamp (seconds) for window_start
