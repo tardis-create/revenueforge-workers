@@ -556,73 +556,96 @@ app.post('/api/products', async (c) => {
   }
 })
 
-// RFQ with email notification and auto-lead creation
+// ============ RFQ ROUTES ============
+
+// POST /api/rfq - Create RFQ (public endpoint, no auth required)
 app.post('/api/rfq', async (c) => {
   try {
     const body = await c.req.json()
+    
+    // Validation: company, contact, email required
+    if (!body.company_name || !body.company_name.trim()) {
+      return c.json({ error: 'Company name is required' }, 400)
+    }
+    if (!body.contact_name || !body.contact_name.trim()) {
+      return c.json({ error: 'Contact name is required' }, 400)
+    }
+    if (!body.email || !body.email.trim()) {
+      return c.json({ error: 'Email is required' }, 400)
+    }
+    
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+    if (!emailRegex.test(body.email)) {
+      return c.json({ error: 'Invalid email format' }, 400)
+    }
+    
     const rfqId = crypto.randomUUID()
     const now = new Date().toISOString()
     
-    // 9. Auto-create lead from RFQ submission
-    const leadId = crypto.randomUUID()
-    let estimatedValue = 0
-    
-    // Parse estimated budget to numeric value
-    if (body.estimated_budget) {
-      const budgetStr = String(body.estimated_budget).replace(/[^0-9.-]/g, '')
-      estimatedValue = parseFloat(budgetStr) || 0
+    // Auto-create lead from RFQ submission (RF-B03 integration)
+    let leadId: string | null = null
+    try {
+      leadId = crypto.randomUUID()
+      let estimatedValue = 0
+      
+      // Parse estimated budget to numeric value
+      if (body.estimated_budget) {
+        const budgetStr = String(body.estimated_budget).replace(/[^0-9.-]/g, '')
+        estimatedValue = parseFloat(budgetStr) || 0
+      }
+      
+      // Create lead from RFQ
+      await c.env.DB.prepare(`
+        INSERT INTO leads (
+          id, company_name, contact_name, email, phone, 
+          status, source, estimated_value, notes, 
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        leadId,
+        body.company_name.trim(),
+        body.contact_name.trim(),
+        body.email.toLowerCase().trim(),
+        body.phone || null,
+        'new',
+        'rfq',
+        estimatedValue,
+        body.project_description || null,
+        now,
+        now
+      ).run()
+      
+      // Create initial lead activity
+      await c.env.DB.prepare(`
+        INSERT INTO lead_activities (id, lead_id, type, description, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(
+        crypto.randomUUID(),
+        leadId,
+        'created',
+        'Lead auto-created from RFQ submission',
+        now
+      ).run()
+    } catch (leadError) {
+      console.error('Failed to create lead from RFQ:', leadError)
+      // Continue even if lead creation fails - RFQ is still valid
+      leadId = null
     }
     
-    // Create lead from RFQ
-    await c.env.DB.prepare(`
-      INSERT INTO leads (
-        id, company_name, contact_name, email, phone, 
-        status, source, estimated_value, notes, 
-        created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(
-      leadId,
-      body.company_name || null,
-      body.contact_name || null,
-      body.email || null,
-      body.phone || null,
-      'new',
-      'rfq',
-      estimatedValue,
-      body.project_description || null,
-      now,
-      now
-    ).run()
-    
-    // Create initial lead activity
-    await c.env.DB.prepare(`
-      INSERT INTO lead_activities (id, lead_id, type, description, created_at)
-      VALUES (?, ?, ?, ?, ?)
-    `).bind(
-      crypto.randomUUID(),
-      leadId,
-      'created',
-      'Lead auto-created from RFQ submission',
-      now
-    ).run()
-    
     // Create RFQ submission with lead link
-    await c.env.DB.prepare(`
-      INSERT INTO rfq_submissions (
-        id, company_name, contact_name, email, phone, 
-        service_type, project_description, estimated_budget, timeline, 
-        status, notes, lead_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(
+    await c.env.DB.prepare(
+      'INSERT INTO rfq_submissions (id, company_name, contact_name, email, phone, service_type, project_description, estimated_budget, timeline, status, notes, lead_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).bind(
       rfqId, 
-      body.company_name, 
-      body.contact_name, 
-      body.email, 
-      body.phone, 
-      body.service_type, 
-      body.project_description, 
-      body.estimated_budget, 
-      body.timeline, 
+      body.company_name.trim(), 
+      body.contact_name.trim(), 
+      body.email.toLowerCase().trim(), 
+      body.phone || null, 
+      body.service_type || null, 
+      body.project_description || null, 
+      body.estimated_budget || null, 
+      body.timeline || null, 
       'new', 
       body.additional_notes || null,
       leadId,
@@ -630,15 +653,15 @@ app.post('/api/rfq', async (c) => {
       now
     ).run()
 
-    // Send confirmation email to customer
+    // Send confirmation email to customer (non-blocking)
     if (body.email) {
       const emailHtml = `
         <h2>RFQ Received - Thank You!</h2>
-        <p>Dear ${body.contact_name || 'Customer'},</p>
+        <p>Dear ${body.contact_name},</p>
         <p>We have received your Request for Quote. Our team will review your requirements and get back to you within 24-48 hours.</p>
         <h3>RFQ Details:</h3>
         <ul>
-          <li><strong>Company:</strong> ${body.company_name || 'N/A'}</li>
+          <li><strong>Company:</strong> ${body.company_name}</li>
           <li><strong>Service Type:</strong> ${body.service_type || 'N/A'}</li>
           <li><strong>Budget:</strong> ${body.estimated_budget || 'Not specified'}</li>
           <li><strong>Timeline:</strong> ${body.timeline || 'Not specified'}</li>
@@ -652,10 +675,10 @@ app.post('/api/rfq', async (c) => {
         body.email,
         'Your RFQ Has Been Received - RevenueForge',
         emailHtml
-      )
+      ).catch(err => console.error('Failed to send confirmation email:', err))
     }
 
-    // Send notification email to admin
+    // Send notification email to admin (non-blocking)
     if (c.env.NOTIFICATION_EMAIL_TO) {
       const adminHtml = `
         <h2>New RFQ Submitted</h2>
@@ -663,10 +686,10 @@ app.post('/api/rfq', async (c) => {
         <h3>Details:</h3>
         <ul>
           <li><strong>RFQ ID:</strong> ${rfqId}</li>
-          <li><strong>Lead ID:</strong> ${leadId}</li>
-          <li><strong>Company:</strong> ${body.company_name || 'N/A'}</li>
-          <li><strong>Contact:</strong> ${body.contact_name || 'N/A'}</li>
-          <li><strong>Email:</strong> ${body.email || 'N/A'}</li>
+          ${leadId ? `<li><strong>Lead ID:</strong> ${leadId}</li>` : ''}
+          <li><strong>Company:</strong> ${body.company_name}</li>
+          <li><strong>Contact:</strong> ${body.contact_name}</li>
+          <li><strong>Email:</strong> ${body.email}</li>
           <li><strong>Phone:</strong> ${body.phone || 'N/A'}</li>
           <li><strong>Service Type:</strong> ${body.service_type || 'N/A'}</li>
           <li><strong>Budget:</strong> ${body.estimated_budget || 'Not specified'}</li>
@@ -674,61 +697,49 @@ app.post('/api/rfq', async (c) => {
         </ul>
         <h3>Project Description:</h3>
         <p>${body.project_description || 'No description provided'}</p>
-        <p><strong>Note:</strong> A new lead has been automatically created from this RFQ.</p>
+        ${leadId ? '<p><strong>Note:</strong> A new lead has been automatically created from this RFQ.</p>' : ''}
         <p><a href="https://revenueforge.pronitopenclaw.workers.dev/admin/rfq">View in Dashboard</a></p>
       `
       
       await sendEmail(
         c.env,
         c.env.NOTIFICATION_EMAIL_TO,
-        `New RFQ: ${body.company_name} - ${body.service_type}`,
+        `New RFQ: ${body.company_name} - ${body.service_type || 'General'}`,
         adminHtml
-      )
+      ).catch(err => console.error('Failed to send admin notification:', err))
     }
 
     return c.json({ 
       success: true, 
       id: rfqId, 
       lead_id: leadId,
-      message: 'RFQ submitted successfully and lead created' 
-    })
+      message: 'RFQ submitted successfully' 
+    }, 201)
   } catch (error) {
     console.error('RFQ error:', error)
     return c.json({ error: 'Failed to submit RFQ' }, 500)
   }
 })
 
-// ============ LEADS/CRM ROUTES ============
-
-// 1. GET /api/leads - Paginated list with filters (status, dealer, date range)
-app.get('/api/leads', async (c) => {
+// GET /api/rfq - Paginated list of RFQs (auth required, admin only)
+app.get('/api/rfq', authMiddleware, async (c) => {
   try {
     const page = parseInt(c.req.query('page') || '1')
     const limit = parseInt(c.req.query('limit') || '50')
     const offset = (page - 1) * limit
     
     const status = c.req.query('status')
-    const dealerId = c.req.query('dealer') || c.req.query('dealer_id')
-    const assignedTo = c.req.query('assigned_to')
     const startDate = c.req.query('start_date')
     const endDate = c.req.query('end_date')
     const search = c.req.query('search')
     
     // Build query with filters
-    let whereConditions = ['deleted_at IS NULL']
+    let whereConditions: string[] = []
     let params: any[] = []
     
     if (status) {
       whereConditions.push('status = ?')
       params.push(status)
-    }
-    
-    if (dealerId) {
-      whereConditions.push('(dealer_id = ? OR assigned_to = ?)')
-      params.push(dealerId, dealerId)
-    } else if (assignedTo) {
-      whereConditions.push('assigned_to = ?')
-      params.push(assignedTo)
     }
     
     if (startDate) {
@@ -747,15 +758,17 @@ app.get('/api/leads', async (c) => {
       params.push(searchTerm, searchTerm, searchTerm)
     }
     
-    const whereClause = whereConditions.join(' AND ')
+    const whereClause = whereConditions.length > 0 
+      ? 'WHERE ' + whereConditions.join(' AND ')
+      : ''
     
     // Get total count
-    const countQuery = `SELECT COUNT(*) as total FROM leads WHERE ${whereClause}`
+    const countQuery = `SELECT COUNT(*) as total FROM rfq_submissions ${whereClause}`
     const countResult = await c.env.DB.prepare(countQuery).bind(...params).first() as any
     const total = countResult?.total || 0
     
     // Get paginated results
-    const dataQuery = `SELECT * FROM leads WHERE ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`
+    const dataQuery = `SELECT * FROM rfq_submissions ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`
     const { results } = await c.env.DB.prepare(dataQuery).bind(...params, limit, offset).all()
     
     return c.json({
@@ -769,134 +782,87 @@ app.get('/api/leads', async (c) => {
       }
     })
   } catch (error) {
-    console.error('Fetch leads error:', error)
-    return c.json({ error: 'Failed to fetch leads' }, 500)
+    console.error('Fetch RFQs error:', error)
+    return c.json({ error: 'Failed to fetch RFQs' }, 500)
   }
 })
 
-// 2. GET /api/leads/:id - Single lead with activity history
-app.get('/api/leads/:id', async (c) => {
+// GET /api/rfq/:id - Single RFQ detail (auth required)
+app.get('/api/rfq/:id', authMiddleware, async (c) => {
   try {
-    const leadId = c.req.param('id')
+    const rfqId = c.req.param('id')
     
-    // Get lead details
-    const lead = await c.env.DB.prepare(
-      'SELECT * FROM leads WHERE id = ? AND deleted_at IS NULL'
-    ).bind(leadId).first()
+    // Get RFQ details
+    const rfq = await c.env.DB.prepare(
+      'SELECT * FROM rfq_submissions WHERE id = ?'
+    ).bind(rfqId).first()
     
-    if (!lead) {
-      return c.json({ error: 'Lead not found' }, 404)
+    if (!rfq) {
+      return c.json({ error: 'RFQ not found' }, 404)
     }
     
-    // Get activity history
-    const { results: activities } = await c.env.DB.prepare(
-      'SELECT * FROM lead_activities WHERE lead_id = ? ORDER BY created_at DESC'
-    ).bind(leadId).all()
-    
-    // Get follow-ups
-    const { results: followUps } = await c.env.DB.prepare(
-      'SELECT * FROM follow_ups WHERE lead_id = ? ORDER BY scheduled_at DESC'
-    ).bind(leadId).all()
+    // Get associated lead if exists
+    let lead = null
+    if ((rfq as any).lead_id) {
+      lead = await c.env.DB.prepare(
+        'SELECT * FROM leads WHERE id = ?'
+      ).bind((rfq as any).lead_id).first()
+    }
     
     return c.json({
       success: true,
-      lead,
-      activities: activities || [],
-      follow_ups: followUps || []
+      rfq,
+      lead
     })
   } catch (error) {
-    console.error('Fetch lead error:', error)
-    return c.json({ error: 'Failed to fetch lead' }, 500)
+    console.error('Fetch RFQ error:', error)
+    return c.json({ error: 'Failed to fetch RFQ' }, 500)
   }
 })
 
-// 3. POST /api/leads - Create lead (returns 201)
-app.post('/api/leads', async (c) => {
+// PATCH /api/rfq/:id - Update RFQ status (auth required)
+app.patch('/api/rfq/:id', authMiddleware, async (c) => {
   try {
+    const rfqId = c.req.param('id')
     const body = await c.req.json()
     
-    // Validate required fields
-    if (!body.company_name && !body.contact_name && !body.email) {
-      return c.json({ error: 'At least one of company_name, contact_name, or email is required' }, 400)
-    }
-    
-    const id = crypto.randomUUID()
-    const now = new Date().toISOString()
-    
-    await c.env.DB.prepare(`
-      INSERT INTO leads (
-        id, company_name, contact_name, email, phone, 
-        status, assigned_to, dealer_id, source, estimated_value, notes, 
-        created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(
-      id,
-      body.company_name || null,
-      body.contact_name || null,
-      body.email || null,
-      body.phone || null,
-      body.status || 'new',
-      body.assigned_to || null,
-      body.dealer_id || body.assigned_to || null,
-      body.source || null,
-      body.estimated_value || 0,
-      body.notes || null,
-      now,
-      now
-    ).run()
-    
-    // Create initial activity
-    await c.env.DB.prepare(`
-      INSERT INTO lead_activities (id, lead_id, type, description, created_at, created_by)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).bind(
-      crypto.randomUUID(),
-      id,
-      'created',
-      'Lead created',
-      now,
-      body.created_by || null
-    ).run()
-    
-    return c.json({
-      success: true,
-      id,
-      message: 'Lead created successfully'
-    }, 201)
-  } catch (error) {
-    console.error('Create lead error:', error)
-    return c.json({ error: 'Failed to create lead' }, 500)
-  }
-})
-
-// 4. PATCH /api/leads/:id - Update lead (status, assignment, etc.)
-app.patch('/api/leads/:id', async (c) => {
-  try {
-    const leadId = c.req.param('id')
-    const body = await c.req.json()
-    
-    // Check if lead exists and is not deleted
+    // Check if RFQ exists
     const existing = await c.env.DB.prepare(
-      'SELECT id FROM leads WHERE id = ? AND deleted_at IS NULL'
-    ).bind(leadId).first()
+      'SELECT id, status, lead_id FROM rfq_submissions WHERE id = ?'
+    ).bind(rfqId).first() as any
     
     if (!existing) {
-      return c.json({ error: 'Lead not found' }, 404)
+      return c.json({ error: 'RFQ not found' }, 404)
     }
     
     const now = new Date().toISOString()
     const updates: string[] = []
     const values: any[] = []
     
-    // Build dynamic update query
-    const allowedFields = ['company_name', 'contact_name', 'email', 'phone', 'status', 
-                          'assigned_to', 'dealer_id', 'source', 'estimated_value', 'notes']
+    // Valid status transitions: new → reviewed → quoted → closed
+    const validStatuses = ['new', 'reviewed', 'quoted', 'closed']
     
-    for (const field of allowedFields) {
-      if (body[field] !== undefined) {
-        updates.push(`${field} = ?`)
-        values.push(body[field])
+    if (body.status) {
+      if (!validStatuses.includes(body.status)) {
+        return c.json({ 
+          error: `Invalid status. Valid statuses: ${validStatuses.join(', ')}` 
+        }, 400)
       }
+      updates.push('status = ?')
+      values.push(body.status)
+      
+      // Update associated lead status when RFQ is closed
+      if (body.status === 'closed' && existing.lead_id) {
+        await c.env.DB.prepare(
+          'UPDATE leads SET status = ?, updated_at = ? WHERE id = ?'
+        ).bind('closed', now, existing.lead_id).run()
+      }
+    }
+    
+    // Allow updating notes
+    if (body.notes !== undefined) {
+      updates.push('notes = ?')
+      values.push(body.notes)
     }
     
     if (updates.length === 0) {
@@ -905,274 +871,70 @@ app.patch('/api/leads/:id', async (c) => {
     
     updates.push('updated_at = ?')
     values.push(now)
-    values.push(leadId)
+    values.push(rfqId)
     
     await c.env.DB.prepare(
-      `UPDATE leads SET ${updates.join(', ')} WHERE id = ?`
+      `UPDATE rfq_submissions SET ${updates.join(', ')} WHERE id = ?`
     ).bind(...values).run()
     
-    // Create activity for status change
-    if (body.status) {
-      await c.env.DB.prepare(`
-        INSERT INTO lead_activities (id, lead_id, type, description, created_at, created_by)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).bind(
-        crypto.randomUUID(),
-        leadId,
-        'status_change',
-        `Status changed to ${body.status}`,
-        now,
-        body.updated_by || null
-      ).run()
-    }
+    // Get updated RFQ
+    const updated = await c.env.DB.prepare(
+      'SELECT * FROM rfq_submissions WHERE id = ?'
+    ).bind(rfqId).first()
     
     return c.json({
       success: true,
-      message: 'Lead updated successfully'
+      message: 'RFQ updated successfully',
+      rfq: updated
     })
   } catch (error) {
-    console.error('Update lead error:', error)
-    return c.json({ error: 'Failed to update lead' }, 500)
+    console.error('Update RFQ error:', error)
+    return c.json({ error: 'Failed to update RFQ' }, 500)
   }
 })
 
-// 5. DELETE /api/leads/:id - Soft-delete lead
-app.delete('/api/leads/:id', async (c) => {
+// Leads (CRM)
+app.get('/api/leads', async (c) => {
   try {
-    const leadId = c.req.param('id')
-    
-    // Check if lead exists and is not already deleted
-    const existing = await c.env.DB.prepare(
-      'SELECT id FROM leads WHERE id = ? AND deleted_at IS NULL'
-    ).bind(leadId).first()
-    
-    if (!existing) {
-      return c.json({ error: 'Lead not found' }, 404)
-    }
-    
-    const now = new Date().toISOString()
-    
-    // Soft delete
-    await c.env.DB.prepare(
-      'UPDATE leads SET deleted_at = ?, updated_at = ? WHERE id = ?'
-    ).bind(now, now, leadId).run()
-    
-    // Create activity
-    await c.env.DB.prepare(`
-      INSERT INTO lead_activities (id, lead_id, type, description, created_at)
-      VALUES (?, ?, ?, ?, ?)
-    `).bind(
-      crypto.randomUUID(),
-      leadId,
-      'deleted',
-      'Lead deleted',
-      now
-    ).run()
-    
-    return c.json({
-      success: true,
-      message: 'Lead deleted successfully'
-    })
+    const { results } = await c.env.DB.prepare('SELECT * FROM leads ORDER BY created_at DESC').all()
+    return c.json({ leads: results })
   } catch (error) {
-    console.error('Delete lead error:', error)
-    return c.json({ error: 'Failed to delete lead' }, 500)
+    return c.json({ error: 'Failed to fetch leads' }, 500)
   }
 })
 
-// 6. POST /api/leads/:id/activity - Add activity note
-app.post('/api/leads/:id/activity', async (c) => {
-  try {
-    const leadId = c.req.param('id')
-    const body = await c.req.json()
-    
-    // Validate required fields
-    if (!body.type || !body.description) {
-      return c.json({ error: 'Type and description are required' }, 400)
-    }
-    
-    // Check if lead exists and is not deleted
-    const existing = await c.env.DB.prepare(
-      'SELECT id FROM leads WHERE id = ? AND deleted_at IS NULL'
-    ).bind(leadId).first()
-    
-    if (!existing) {
-      return c.json({ error: 'Lead not found' }, 404)
-    }
-    
-    const id = crypto.randomUUID()
-    const now = new Date().toISOString()
-    
-    await c.env.DB.prepare(`
-      INSERT INTO lead_activities (id, lead_id, type, description, created_at, created_by)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).bind(
-      id,
-      leadId,
-      body.type,
-      body.description,
-      now,
-      body.created_by || null
-    ).run()
-    
-    // Update lead's updated_at timestamp
-    await c.env.DB.prepare(
-      'UPDATE leads SET updated_at = ? WHERE id = ?'
-    ).bind(now, leadId).run()
-    
-    return c.json({
-      success: true,
-      id,
-      message: 'Activity added successfully'
-    }, 201)
-  } catch (error) {
-    console.error('Add activity error:', error)
-    return c.json({ error: 'Failed to add activity' }, 500)
-  }
-})
-
-// 7. PATCH /api/leads/:id/assign - Assign to dealer
-app.patch('/api/leads/:id/assign', async (c) => {
-  try {
-    const leadId = c.req.param('id')
-    const body = await c.req.json()
-    
-    // Validate required fields
-    if (!body.dealer_id && !body.assigned_to) {
-      return c.json({ error: 'dealer_id or assigned_to is required' }, 400)
-    }
-    
-    // Check if lead exists and is not deleted
-    const existing = await c.env.DB.prepare(
-      'SELECT id, assigned_to FROM leads WHERE id = ? AND deleted_at IS NULL'
-    ).bind(leadId).first() as any
-    
-    if (!existing) {
-      return c.json({ error: 'Lead not found' }, 404)
-    }
-    
-    const now = new Date().toISOString()
-    const dealerId = body.dealer_id || body.assigned_to
-    const previousAssignee = existing.assigned_to
-    
-    // Update assignment
-    await c.env.DB.prepare(
-      'UPDATE leads SET assigned_to = ?, dealer_id = ?, updated_at = ? WHERE id = ?'
-    ).bind(dealerId, dealerId, now, leadId).run()
-    
-    // Create activity
-    await c.env.DB.prepare(`
-      INSERT INTO lead_activities (id, lead_id, type, description, created_at, created_by)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).bind(
-      crypto.randomUUID(),
-      leadId,
-      'assignment',
-      previousAssignee 
-        ? `Reassigned from ${previousAssignee} to ${dealerId}`
-        : `Assigned to ${dealerId}`,
-      now,
-      body.assigned_by || null
-    ).run()
-    
-    return c.json({
-      success: true,
-      message: 'Lead assigned successfully',
-      assigned_to: dealerId
-    })
-  } catch (error) {
-    console.error('Assign lead error:', error)
-    return c.json({ error: 'Failed to assign lead' }, 500)
-  }
-})
-
-// 8. GET /api/leads/stats - Count per status, total value
-app.get('/api/leads/stats', async (c) => {
-  try {
-    const startDate = c.req.query('start_date')
-    const endDate = c.req.query('end_date')
-    const dealerId = c.req.query('dealer')
-    
-    // Build where clause
-    let whereConditions = ['deleted_at IS NULL']
-    let params: any[] = []
-    
-    if (dealerId) {
-      whereConditions.push('(dealer_id = ? OR assigned_to = ?)')
-      params.push(dealerId, dealerId)
-    }
-    
-    if (startDate) {
-      whereConditions.push('created_at >= ?')
-      params.push(startDate)
-    }
-    
-    if (endDate) {
-      whereConditions.push('created_at <= ?')
-      params.push(endDate)
-    }
-    
-    const whereClause = whereConditions.join(' AND ')
-    
-    // Get counts by status
-    const { results: statusCounts } = await c.env.DB.prepare(
-      `SELECT status, COUNT(*) as count FROM leads WHERE ${whereClause} GROUP BY status`
-    ).bind(...params).all()
-    
-    // Get total value
-    const totalValueResult = await c.env.DB.prepare(
-      `SELECT SUM(estimated_value) as total_value, COUNT(*) as total_count FROM leads WHERE ${whereClause}`
-    ).bind(...params).first() as any
-    
-    // Get average value
-    const avgValueResult = await c.env.DB.prepare(
-      `SELECT AVG(estimated_value) as avg_value FROM leads WHERE ${whereClause} AND estimated_value > 0`
-    ).bind(...params).first() as any
-    
-    // Format status counts
-    const byStatus: Record<string, number> = {}
-    for (const row of (statusCounts || [])) {
-      byStatus[(row as any).status] = (row as any).count
-    }
-    
-    return c.json({
-      success: true,
-      stats: {
-        by_status: byStatus,
-        total_count: totalValueResult?.total_count || 0,
-        total_value: totalValueResult?.total_value || 0,
-        average_value: avgValueResult?.avg_value || 0
-      }
-    })
-  } catch (error) {
-    console.error('Lead stats error:', error)
-    return c.json({ error: 'Failed to get lead stats' }, 500)
-  }
-})
-
-// Legacy endpoint: GET /api/leads/:id/activities (for backward compatibility)
-app.get('/api/leads/:id/activities', async (c) => {
-  try {
-    const { results } = await c.env.DB.prepare(
-      'SELECT * FROM lead_activities WHERE lead_id = ? ORDER BY created_at DESC'
-    ).bind(c.req.param('id')).all()
-    return c.json({ activities: results })
-  } catch (error) {
-    return c.json({ error: 'Failed to fetch activities' }, 500)
-  }
-})
-
-// Legacy endpoint: POST /api/leads/:id/activities (for backward compatibility)
-app.post('/api/leads/:id/activities', async (c) => {
+app.post('/api/leads', async (c) => {
   try {
     const body = await c.req.json()
     const id = crypto.randomUUID()
     const now = new Date().toISOString()
     await c.env.DB.prepare(
-      'INSERT INTO lead_activities (id, lead_id, type, description, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?)'
-    ).bind(id, c.req.param('id'), body.type, body.description, now, body.created_by).run()
+      'INSERT INTO leads (id, company_name, contact_name, email, phone, status, assigned_to, source, estimated_value, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).bind(id, body.company_name, body.contact_name, body.email, body.phone, body.status || 'new', body.assigned_to, body.source, body.estimated_value || 0, body.notes, now, now).run()
     return c.json({ success: true, id })
   } catch (error) {
-    return c.json({ error: 'Failed to create activity' }, 500)
+    return c.json({ error: 'Failed to create lead' }, 500)
+  }
+})
+
+app.get('/api/leads/:id', async (c) => {
+  try {
+    const lead = await c.env.DB.prepare('SELECT * FROM leads WHERE id = ?').bind(c.req.param('id')).first()
+    if (!lead) return c.json({ error: 'Lead not found' }, 404)
+    return c.json({ lead })
+  } catch (error) {
+    return c.json({ error: 'Failed to fetch lead' }, 500)
+  }
+})
+
+app.patch('/api/leads/:id', async (c) => {
+  try {
+    const body = await c.req.json()
+    const now = new Date().toISOString()
+    await c.env.DB.prepare('UPDATE leads SET status = ?, updated_at = ? WHERE id = ?').bind(body.status, now, c.req.param('id')).run()
+    return c.json({ success: true })
+  } catch (error) {
+    return c.json({ error: 'Failed to update lead' }, 500)
   }
 })
 
@@ -1325,6 +1087,472 @@ Please follow up with this lead.`
   } catch (error) {
     console.error('Send reminders error:', error)
     return c.json({ error: 'Failed to send reminders' }, 500)
+  }
+})
+
+// ============ QUOTES ROUTES ============
+
+// Helper: Generate unique quote number
+async function generateQuoteNumber(db: D1Database): Promise<string> {
+  const now = new Date()
+  const year = now.getFullYear()
+  const month = String(now.getMonth() + 1).padStart(2, '0')
+  
+  // Get count of quotes this month
+  const { results } = await db.prepare(`
+    SELECT COUNT(*) as count FROM quotes 
+    WHERE quote_number LIKE ?
+  `).bind(`QT-${year}${month}-%`).all()
+  
+  const count = ((results?.[0] as any)?.count || 0) + 1
+  return `QT-${year}${month}-${String(count).padStart(4, '0')}`
+}
+
+// Helper: Recalculate quote totals
+async function recalculateQuoteTotals(db: D1Database, quoteId: string): Promise<void> {
+  // Get all items for this quote
+  const { results } = await db.prepare(
+    'SELECT quantity, unit_price, discount, total FROM quote_items WHERE quote_id = ?'
+  ).bind(quoteId).all()
+  
+  const items = results as Array<{ quantity: number; unit_price: number; discount: number; total: number }>
+  
+  // Calculate subtotal from items
+  let subtotal = 0
+  for (const item of items) {
+    subtotal += (item.quantity * item.unit_price) - (item.discount || 0)
+  }
+  
+  // Get quote-level discount and tax
+  const quote = await db.prepare('SELECT discount, tax FROM quotes WHERE id = ?').bind(quoteId).first() as { discount: number; tax: number } | null
+  
+  const quoteDiscount = quote?.discount || 0
+  const quoteTax = quote?.tax || 0
+  
+  // Calculate total
+  const afterDiscount = subtotal - quoteDiscount
+  const taxAmount = afterDiscount * (quoteTax / 100)
+  const total = afterDiscount + taxAmount
+  
+  // Update quote
+  await db.prepare(`
+    UPDATE quotes SET subtotal = ?, total = ?, updated_at = ? WHERE id = ?
+  `).bind(subtotal, total, new Date().toISOString(), quoteId).run()
+}
+
+// 1. GET /api/quotes - Paginated list with status filter
+app.get('/api/quotes', async (c) => {
+  try {
+    const status = c.req.query('status')
+    const page = parseInt(c.req.query('page') || '1')
+    const limit = parseInt(c.req.query('limit') || '20')
+    const offset = (page - 1) * limit
+    
+    let query = 'SELECT * FROM quotes WHERE 1=1'
+    const params: any[] = []
+    
+    if (status) {
+      query += ' AND status = ?'
+      params.push(status)
+    }
+    
+    query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?'
+    params.push(limit, offset)
+    
+    const { results } = await c.env.DB.prepare(query).bind(...params).all()
+    
+    // Get total count for pagination
+    let countQuery = 'SELECT COUNT(*) as total FROM quotes WHERE 1=1'
+    const countParams: any[] = []
+    if (status) {
+      countQuery += ' AND status = ?'
+      countParams.push(status)
+    }
+    const { results: countResult } = await c.env.DB.prepare(countQuery).bind(...countParams).all()
+    const total = (countResult?.[0] as any)?.total || 0
+    
+    return c.json({
+      quotes: results,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
+    })
+  } catch (error) {
+    console.error('Fetch quotes error:', error)
+    return c.json({ error: 'Failed to fetch quotes' }, 500)
+  }
+})
+
+// 2. GET /api/quotes/:id - Single quote with line items
+app.get('/api/quotes/:id', async (c) => {
+  try {
+    const quoteId = c.req.param('id')
+    
+    const quote = await c.env.DB.prepare('SELECT * FROM quotes WHERE id = ?').bind(quoteId).first()
+    if (!quote) {
+      return c.json({ error: 'Quote not found' }, 404)
+    }
+    
+    // Get line items
+    const { results: items } = await c.env.DB.prepare(
+      'SELECT * FROM quote_items WHERE quote_id = ? ORDER BY sort_order, created_at'
+    ).bind(quoteId).all()
+    
+    return c.json({
+      quote,
+      items: items || []
+    })
+  } catch (error) {
+    console.error('Fetch quote error:', error)
+    return c.json({ error: 'Failed to fetch quote' }, 500)
+  }
+})
+
+// 3. POST /api/quotes - Create quote with line items (returns 201)
+app.post('/api/quotes', async (c) => {
+  try {
+    const body = await c.req.json()
+    const id = crypto.randomUUID()
+    const now = new Date().toISOString()
+    const quoteNumber = await generateQuoteNumber(c.env.DB)
+    
+    // Calculate initial totals from items
+    let subtotal = 0
+    const items = body.items || []
+    for (const item of items) {
+      const itemTotal = (item.quantity || 1) * (item.unit_price || 0) - (item.discount || 0)
+      subtotal += itemTotal
+    }
+    
+    const quoteDiscount = body.discount || 0
+    const quoteTax = body.tax || 0
+    const afterDiscount = subtotal - quoteDiscount
+    const taxAmount = afterDiscount * (quoteTax / 100)
+    const total = afterDiscount + taxAmount
+    
+    // Insert quote
+    await c.env.DB.prepare(`
+      INSERT INTO quotes (
+        id, quote_number, rfq_id, lead_id, company_name, contact_name,
+        email, phone, status, valid_until, notes, terms,
+        subtotal, discount, tax, total, created_at, updated_at, created_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      id,
+      quoteNumber,
+      body.rfq_id || null,
+      body.lead_id || null,
+      body.company_name || null,
+      body.contact_name || null,
+      body.email || null,
+      body.phone || null,
+      body.status || 'draft',
+      body.valid_until || null,
+      body.notes || null,
+      body.terms || null,
+      subtotal,
+      quoteDiscount,
+      quoteTax,
+      total,
+      now,
+      now,
+      body.created_by || null
+    ).run()
+    
+    // Insert line items
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]
+      const itemId = crypto.randomUUID()
+      const itemTotal = (item.quantity || 1) * (item.unit_price || 0) - (item.discount || 0)
+      
+      await c.env.DB.prepare(`
+        INSERT INTO quote_items (id, quote_id, description, quantity, unit_price, discount, total, sort_order, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        itemId,
+        id,
+        item.description,
+        item.quantity || 1,
+        item.unit_price || 0,
+        item.discount || 0,
+        itemTotal,
+        i,
+        now
+      ).run()
+    }
+    
+    return c.json({
+      success: true,
+      id,
+      quote_number: quoteNumber,
+      message: 'Quote created successfully'
+    }, 201)
+  } catch (error) {
+    console.error('Create quote error:', error)
+    return c.json({ error: 'Failed to create quote' }, 500)
+  }
+})
+
+// 4. POST /api/quotes/from-rfq/:rfq_id - Create quote pre-filled from RFQ
+app.post('/api/quotes/from-rfq/:rfq_id', async (c) => {
+  try {
+    const rfqId = c.req.param('rfq_id')
+    
+    // Get RFQ details
+    const rfq = await c.env.DB.prepare('SELECT * FROM rfq_submissions WHERE id = ?').bind(rfqId).first()
+    if (!rfq) {
+      return c.json({ error: 'RFQ not found' }, 404)
+    }
+    
+    const body = await c.req.json().catch(() => ({}))
+    const id = crypto.randomUUID()
+    const now = new Date().toISOString()
+    const quoteNumber = await generateQuoteNumber(c.env.DB)
+    
+    // Create quote from RFQ data
+    await c.env.DB.prepare(`
+      INSERT INTO quotes (
+        id, quote_number, rfq_id, lead_id, company_name, contact_name,
+        email, phone, status, valid_until, notes, terms,
+        subtotal, discount, tax, total, created_at, updated_at, created_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      id,
+      quoteNumber,
+      rfqId,
+      (rfq as any).lead_id || null,
+      (rfq as any).company_name || null,
+      (rfq as any).contact_name || null,
+      (rfq as any).email || null,
+      (rfq as any).phone || null,
+      'draft',
+      body.valid_until || null,
+      `Created from RFQ\n\nProject: ${(rfq as any).project_description || 'N/A'}\nBudget: ${(rfq as any).estimated_budget || 'N/A'}\nTimeline: ${(rfq as any).timeline || 'N/A'}`,
+      body.terms || null,
+      0, 0, 0, 0,
+      now,
+      now,
+      body.created_by || null
+    ).run()
+    
+    return c.json({
+      success: true,
+      id,
+      quote_number: quoteNumber,
+      message: 'Quote created from RFQ'
+    }, 201)
+  } catch (error) {
+    console.error('Create quote from RFQ error:', error)
+    return c.json({ error: 'Failed to create quote from RFQ' }, 500)
+  }
+})
+
+// 5. PATCH /api/quotes/:id - Update quote details
+app.patch('/api/quotes/:id', async (c) => {
+  try {
+    const quoteId = c.req.param('id')
+    const body = await c.req.json()
+    const now = new Date().toISOString()
+    
+    // Check if quote exists
+    const existing = await c.env.DB.prepare('SELECT id FROM quotes WHERE id = ?').bind(quoteId).first()
+    if (!existing) {
+      return c.json({ error: 'Quote not found' }, 404)
+    }
+    
+    // Build dynamic update query
+    const updates: string[] = []
+    const params: any[] = []
+    
+    const allowedFields = ['company_name', 'contact_name', 'email', 'phone', 'valid_until', 'notes', 'terms', 'discount', 'tax']
+    for (const field of allowedFields) {
+      if (body[field] !== undefined) {
+        updates.push(`${field} = ?`)
+        params.push(body[field])
+      }
+    }
+    
+    if (updates.length === 0) {
+      return c.json({ error: 'No valid fields to update' }, 400)
+    }
+    
+    updates.push('updated_at = ?')
+    params.push(now)
+    params.push(quoteId)
+    
+    await c.env.DB.prepare(
+      `UPDATE quotes SET ${updates.join(', ')} WHERE id = ?`
+    ).bind(...params).run()
+    
+    // Recalculate totals if discount or tax changed
+    if (body.discount !== undefined || body.tax !== undefined) {
+      await recalculateQuoteTotals(c.env.DB, quoteId)
+    }
+    
+    return c.json({ success: true, message: 'Quote updated' })
+  } catch (error) {
+    console.error('Update quote error:', error)
+    return c.json({ error: 'Failed to update quote' }, 500)
+  }
+})
+
+// 6. POST /api/quotes/:id/items - Add line item to quote
+app.post('/api/quotes/:id/items', async (c) => {
+  try {
+    const quoteId = c.req.param('id')
+    const body = await c.req.json()
+    
+    // Check if quote exists
+    const existing = await c.env.DB.prepare('SELECT id FROM quotes WHERE id = ?').bind(quoteId).first()
+    if (!existing) {
+      return c.json({ error: 'Quote not found' }, 404)
+    }
+    
+    if (!body.description) {
+      return c.json({ error: 'Item description is required' }, 400)
+    }
+    
+    const id = crypto.randomUUID()
+    const now = new Date().toISOString()
+    const quantity = body.quantity || 1
+    const unitPrice = body.unit_price || 0
+    const discount = body.discount || 0
+    const total = (quantity * unitPrice) - discount
+    
+    // Get max sort_order
+    const { results } = await c.env.DB.prepare(
+      'SELECT MAX(sort_order) as max_order FROM quote_items WHERE quote_id = ?'
+    ).bind(quoteId).all()
+    const sortOrder = ((results?.[0] as any)?.max_order || -1) + 1
+    
+    await c.env.DB.prepare(`
+      INSERT INTO quote_items (id, quote_id, description, quantity, unit_price, discount, total, sort_order, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(id, quoteId, body.description, quantity, unitPrice, discount, total, sortOrder, now).run()
+    
+    // Recalculate totals
+    await recalculateQuoteTotals(c.env.DB, quoteId)
+    
+    return c.json({ success: true, id, message: 'Item added to quote' }, 201)
+  } catch (error) {
+    console.error('Add quote item error:', error)
+    return c.json({ error: 'Failed to add item to quote' }, 500)
+  }
+})
+
+// 7. DELETE /api/quotes/:id/items/:item_id - Remove line item
+app.delete('/api/quotes/:id/items/:item_id', async (c) => {
+  try {
+    const quoteId = c.req.param('id')
+    const itemId = c.req.param('item_id')
+    
+    // Check if quote and item exist
+    const item = await c.env.DB.prepare(
+      'SELECT id FROM quote_items WHERE id = ? AND quote_id = ?'
+    ).bind(itemId, quoteId).first()
+    
+    if (!item) {
+      return c.json({ error: 'Item not found' }, 404)
+    }
+    
+    await c.env.DB.prepare('DELETE FROM quote_items WHERE id = ?').bind(itemId).run()
+    
+    // Recalculate totals
+    await recalculateQuoteTotals(c.env.DB, quoteId)
+    
+    return c.json({ success: true, message: 'Item removed from quote' })
+  } catch (error) {
+    console.error('Delete quote item error:', error)
+    return c.json({ error: 'Failed to remove item from quote' }, 500)
+  }
+})
+
+// 8. PATCH /api/quotes/:id/status - Change quote status
+app.patch('/api/quotes/:id/status', async (c) => {
+  try {
+    const quoteId = c.req.param('id')
+    const body = await c.req.json()
+    const now = new Date().toISOString()
+    
+    if (!body.status) {
+      return c.json({ error: 'Status is required' }, 400)
+    }
+    
+    const validStatuses = ['draft', 'sent', 'accepted', 'rejected', 'expired', 'cancelled']
+    if (!validStatuses.includes(body.status)) {
+      return c.json({ error: `Invalid status. Valid statuses: ${validStatuses.join(', ')}` }, 400)
+    }
+    
+    // Check if quote exists
+    const existing = await c.env.DB.prepare('SELECT id FROM quotes WHERE id = ?').bind(quoteId).first()
+    if (!existing) {
+      return c.json({ error: 'Quote not found' }, 404)
+    }
+    
+    await c.env.DB.prepare(
+      'UPDATE quotes SET status = ?, updated_at = ? WHERE id = ?'
+    ).bind(body.status, now, quoteId).run()
+    
+    return c.json({ success: true, message: 'Quote status updated' })
+  } catch (error) {
+    console.error('Update quote status error:', error)
+    return c.json({ error: 'Failed to update quote status' }, 500)
+  }
+})
+
+// PATCH /api/quotes/:id/items/:item_id - Update line item
+app.patch('/api/quotes/:id/items/:item_id', async (c) => {
+  try {
+    const quoteId = c.req.param('id')
+    const itemId = c.req.param('item_id')
+    const body = await c.req.json()
+    
+    // Check if item exists
+    const item = await c.env.DB.prepare(
+      'SELECT id FROM quote_items WHERE id = ? AND quote_id = ?'
+    ).bind(itemId, quoteId).first()
+    
+    if (!item) {
+      return c.json({ error: 'Item not found' }, 404)
+    }
+    
+    const updates: string[] = []
+    const params: any[] = []
+    
+    const allowedFields = ['description', 'quantity', 'unit_price', 'discount', 'sort_order']
+    for (const field of allowedFields) {
+      if (body[field] !== undefined) {
+        updates.push(`${field} = ?`)
+        params.push(body[field])
+      }
+    }
+    
+    if (updates.length === 0) {
+      return c.json({ error: 'No valid fields to update' }, 400)
+    }
+    
+    params.push(itemId)
+    
+    await c.env.DB.prepare(
+      `UPDATE quote_items SET ${updates.join(', ')} WHERE id = ?`
+    ).bind(...params).run()
+    
+    // Recalculate item total and quote totals
+    const quantity = body.quantity !== undefined ? body.quantity : 1
+    const unitPrice = body.unit_price !== undefined ? body.unit_price : 0
+    const discount = body.discount !== undefined ? body.discount : 0
+    const total = (quantity * unitPrice) - discount
+    
+    await c.env.DB.prepare('UPDATE quote_items SET total = ? WHERE id = ?').bind(total, itemId).run()
+    await recalculateQuoteTotals(c.env.DB, quoteId)
+    
+    return c.json({ success: true, message: 'Item updated' })
+  } catch (error) {
+    console.error('Update quote item error:', error)
+    return c.json({ error: 'Failed to update item' }, 500)
   }
 })
 
