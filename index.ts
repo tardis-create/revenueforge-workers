@@ -1046,7 +1046,7 @@ app.post('/api/rfq', async (c) => {
         'new',
         'rfq',
         estimatedValue,
-        body.project_description || null,
+        body.product_requirements || body.project_description || null,
         now,
         now
       ).run()
@@ -1068,9 +1068,15 @@ app.post('/api/rfq', async (c) => {
       leadId = null
     }
     
+    // Map frontend field names to DB column names:
+    // product_requirements -> project_description
+    // delivery_timeline -> timeline
+    const projectDescription = body.product_requirements || body.project_description || null
+    const timeline = body.delivery_timeline || body.timeline || null
+
     // Create RFQ submission with lead link
     await c.env.DB.prepare(
-      'INSERT INTO rfq_submissions (id, company_name, contact_name, email, phone, service_type, project_description, estimated_budget, timeline, status, notes, lead_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      'INSERT INTO rfq_submissions (id, company_name, contact_name, email, phone, service_type, project_description, estimated_budget, timeline, status, notes, lead_id, quantity, unit, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
     ).bind(
       rfqId, 
       body.company_name.trim(), 
@@ -1078,12 +1084,14 @@ app.post('/api/rfq', async (c) => {
       body.email.toLowerCase().trim(), 
       body.phone || null, 
       body.service_type || null, 
-      body.project_description || null, 
+      projectDescription, 
       body.estimated_budget || null, 
-      body.timeline || null, 
+      timeline, 
       'new', 
       body.additional_notes || null,
       leadId,
+      body.quantity || null,
+      body.unit || null,
       now, 
       now
     ).run()
