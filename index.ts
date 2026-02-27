@@ -3,6 +3,7 @@ import { cors } from 'hono/cors'
 import { Resend } from 'resend'
 import { SignJWT, jwtVerify } from 'jose'
 import bcrypt from 'bcryptjs'
+import { nanoid } from 'nanoid'
 
 type Bindings = {
   DB: D1Database
@@ -2997,6 +2998,168 @@ app.post('/api/reports/send-daily-summary', async (c) => {
   } catch (error) {
     console.error('Daily summary error:', error)
     return c.json({ error: 'Failed to send daily summary' }, 500)
+  }
+})
+
+// ============================================
+// DASHBOARD API - Admin Dashboard Stats
+// ============================================
+
+// GET /api/dashboard/stats - Returns aggregated KPIs for admin dashboard
+app.get('/api/dashboard/stats', authMiddleware, async (c) => {
+  try {
+    // Get total products count
+    const productsCount = await c.env.DB.prepare(
+      'SELECT COUNT(*) as count FROM products WHERE is_active = 1'
+    ).first() as { count: number }
+
+    // Get leads by status
+    const leadsByStatus = await c.env.DB.prepare(
+      'SELECT status, COUNT(*) as count FROM leads GROUP BY status'
+    ).all()
+
+    // Calculate active leads (new, contacted, qualified, proposal)
+    const activeStatuses = ['new', 'contacted', 'qualified', 'proposal']
+    const activeLeads = (leadsByStatus.results || [])
+      .filter((r: any) => activeStatuses.includes(r.status))
+      .reduce((sum: number, r: any) => sum + r.count, 0)
+
+    // Get open quotes count (draft, sent)
+    const quotesCount = await c.env.DB.prepare(
+      "SELECT COUNT(*) as count FROM quotes WHERE status IN ('draft', 'sent')"
+    ).first() as { count: number }
+
+    // Get total revenue from accepted quotes
+    const revenueResult = await c.env.DB.prepare(
+      "SELECT COALESCE(SUM(amount), 0) as total FROM quotes WHERE status = 'accepted'"
+    ).first() as { total: number }
+
+    // Get revenue trend (last 6 months)
+    const sixMonthsAgo = new Date()
+    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 5)
+    sixMonthsAgo.setDate(1)
+    const startDate = sixMonthsAgo.toISOString().split('T')[0]
+
+    const revenueTrend = await c.env.DB.prepare(
+      `SELECT 
+        strftime('%Y-%m', created_at) as month,
+        COALESCE(SUM(amount), 0) as revenue
+       FROM quotes 
+       WHERE status = 'accepted' AND created_at >= ?
+       GROUP BY strftime('%Y-%m', created_at)
+       ORDER BY month ASC`
+    ).bind(startDate).all()
+
+    // Format leads by status for chart
+    const statusColors: Record<string, string> = {
+      'new': 'bg-blue-500/60',
+      'contacted': 'bg-amber-500/60',
+      'qualified': 'bg-purple-500/60',
+      'proposal': 'bg-cyan-500/60',
+      'won': 'bg-emerald-500/60',
+      'lost': 'bg-zinc-500/60'
+    }
+
+    const formattedLeadsByStatus = Object.keys(statusColors).map(status => {
+      const found = (leadsByStatus.results || []).find((r: any) => r.status === status)
+      return {
+        status,
+        count: found ? (found as any).count : 0,
+        color: statusColors[status]
+      }
+    })
+
+    // Format revenue trend (fill in missing months)
+    const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    const revenueByMonth: Record<string, number> = {}
+    for (const row of (revenueTrend.results || [])) {
+      const r = row as any
+      revenueByMonth[r.month] = r.revenue
+    }
+
+    const formattedRevenueTrend = []
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date()
+      d.setMonth(d.getMonth() - i)
+      const monthKey = d.toISOString().slice(0, 7)
+      const monthName = monthNames[d.getMonth()]
+      formattedRevenueTrend.push({
+        month: monthName,
+        revenue: revenueByMonth[monthKey] || 0
+      })
+    }
+
+    return c.json({
+      success: true,
+      data: {
+        totalProducts: productsCount?.count || 0,
+        activeLeads,
+        openQuotes: quotesCount?.count || 0,
+        revenue: revenueResult?.total || 0,
+        leadsByStatus: formattedLeadsByStatus,
+        revenueTrend: formattedRevenueTrend
+      }
+    })
+  } catch (error) {
+    console.error('Error fetching dashboard stats:', error)
+    return c.json({ error: 'Failed to fetch dashboard stats' }, 500)
+  }
+})
+
+// GET /api/dashboard/activity - Returns recent audit log entries
+app.get('/api/dashboard/activity', authMiddleware, async (c) => {
+  try {
+    const limit = c.req.query('limit') || '10'
+    const limitNum = Math.min(parseInt(limit) || 10, 50)
+
+    const { results } = await c.env.DB.prepare(
+      `SELECT 
+        id, action, resource_type, resource_id, details, timestamp,
+        (SELECT name FROM users WHERE id = audit_log.user_id) as user_name
+       FROM audit_log 
+       ORDER BY timestamp DESC 
+       LIMIT ?`
+    ).bind(limitNum).all()
+
+    return c.json({
+      success: true,
+      data: results || []
+    })
+  } catch (error) {
+    console.error('Error fetching dashboard activity:', error)
+    return c.json({ error: 'Failed to fetch activity' }, 500)
+  }
+})
+
+// POST /api/audit-log - Create an audit log entry (for tracking actions)
+app.post('/api/audit-log', authMiddleware, async (c) => {
+  try {
+    const user = c.get('user') as any
+    const body = await c.req.json()
+    const { action, resource_type, resource_id, details } = body
+
+    if (!action || !resource_type) {
+      return c.json({ error: 'action and resource_type are required' }, 400)
+    }
+
+    const id = nanoid()
+
+    await c.env.DB.prepare(
+      `INSERT INTO audit_log (id, user_id, action, resource_type, resource_id, details, timestamp)
+       VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
+    ).bind(
+      id,
+      user.sub || user.id,
+      action,
+      resource_type,
+      resource_id || null,
+      details ? JSON.stringify(details) : null
+    ).run()
+
+    return c.json({ success: true, id })
+  } catch (error) {
+    console.error('Error creating audit log:', error)
+    return c.json({ error: 'Failed to create audit log' }, 500)
   }
 })
 
