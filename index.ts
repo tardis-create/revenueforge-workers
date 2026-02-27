@@ -615,18 +615,29 @@ app.get('/api/products', async (c) => {
     
     // Get paginated results
     const { results } = await c.env.DB.prepare(
-      `SELECT id, sku, name, description, category, base_price, cost_price, unit, 
-              stock_quantity, is_active, image_url, specifications, created_at, updated_at
+      `SELECT id, sku, name, description, category, industry, price, 
+              in_stock, is_active, image_url, technical_specs, created_at, updated_at
        FROM products 
        WHERE ${whereClause}
        ORDER BY created_at DESC
        LIMIT ? OFFSET ?`
     ).bind(...params, limit, offset).all()
     
-    // Parse specifications JSON
+    // Parse technical_specs JSON and map to expected response format
     const products = (results || []).map((p: any) => ({
-      ...p,
-      specifications: p.specifications ? JSON.parse(p.specifications) : null
+      id: p.id,
+      sku: p.sku,
+      name: p.name,
+      description: p.description,
+      category: p.category,
+      industry: p.industry,
+      base_price: p.price, // Map price -> base_price for API response
+      stock_quantity: p.in_stock, // Map in_stock -> stock_quantity for API response
+      is_active: p.is_active,
+      image_url: p.image_url,
+      specifications: p.technical_specs ? JSON.parse(p.technical_specs) : null, // Map technical_specs -> specifications
+      created_at: p.created_at,
+      updated_at: p.updated_at
     }))
     
     const response = {
@@ -670,8 +681,8 @@ app.get('/api/products/:id', async (c) => {
     }
     
     const product = await c.env.DB.prepare(
-      `SELECT id, sku, name, description, category, base_price, cost_price, unit,
-              stock_quantity, is_active, image_url, specifications, created_at, updated_at
+      `SELECT id, sku, name, description, category, industry, price,
+              in_stock, is_active, image_url, technical_specs, created_at, updated_at
        FROM products WHERE id = ?`
     ).bind(productId).first() as any
     
@@ -679,19 +690,31 @@ app.get('/api/products/:id', async (c) => {
       return c.json({ error: 'Product not found' }, 404)
     }
     
-    // Parse specifications JSON
-    if (product.specifications) {
-      product.specifications = JSON.parse(product.specifications)
+    // Map database columns to API response format
+    const response = {
+      id: product.id,
+      sku: product.sku,
+      name: product.name,
+      description: product.description,
+      category: product.category,
+      industry: product.industry,
+      base_price: product.price, // Map price -> base_price
+      stock_quantity: product.in_stock, // Map in_stock -> stock_quantity
+      is_active: product.is_active,
+      image_url: product.image_url,
+      specifications: product.technical_specs ? JSON.parse(product.technical_specs) : null, // Map technical_specs -> specifications
+      created_at: product.created_at,
+      updated_at: product.updated_at
     }
     
     // Cache for 5 minutes
     if (c.env.CACHE) {
-      await c.env.CACHE.put(cacheKey, JSON.stringify(product), {
+      await c.env.CACHE.put(cacheKey, JSON.stringify(response), {
         expirationTtl: PRODUCTS_CACHE_TTL
       })
     }
     
-    return c.json({ success: true, data: product, cached: false })
+    return c.json({ success: true, data: response, cached: false })
   } catch (error) {
     console.error('Error fetching product:', error)
     return c.json({ error: 'Failed to fetch product' }, 500)
@@ -720,21 +743,24 @@ app.post('/api/products', adminMiddleware, async (c) => {
     const id = 'prod_' + crypto.randomUUID().replace(/-/g, '').substring(0, 16)
     const now = new Date().toISOString()
     
+    // Map API fields to database columns
+    // base_price -> price, stock_quantity -> in_stock, specifications -> technical_specs
+    // cost_price and unit are not stored (columns don't exist in DB)
+    
     await c.env.DB.prepare(`
-      INSERT INTO products (id, sku, name, description, category, base_price, cost_price, unit, stock_quantity, is_active, specifications, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO products (id, sku, name, description, category, industry, price, in_stock, is_active, technical_specs, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
       id,
       body.sku,
       body.name,
       body.description || null,
       body.category || null,
-      body.base_price || 0,
-      body.cost_price || 0,
-      body.unit || 'pcs',
-      body.stock_quantity || 0,
+      body.industry || null,
+      body.base_price || 0, // Map base_price -> price
+      body.stock_quantity !== undefined ? (body.stock_quantity ? 1 : 0) : 1, // Map stock_quantity -> in_stock
       body.is_active !== false ? 1 : 0,
-      body.specifications ? JSON.stringify(body.specifications) : null,
+      body.specifications ? JSON.stringify(body.specifications) : null, // Map specifications -> technical_specs
       now,
       now
     ).run()
@@ -784,17 +810,32 @@ app.patch('/api/products/:id', adminMiddleware, async (c) => {
     const values: any[] = []
     
     // Build dynamic update
-    const allowedFields = ['sku', 'name', 'description', 'category', 'base_price', 'cost_price', 'unit', 'stock_quantity', 'is_active', 'specifications']
+    // Map API field names to database column names:
+    // base_price -> price, stock_quantity -> in_stock, specifications -> technical_specs
+    const fieldMapping: Record<string, string> = {
+      'sku': 'sku',
+      'name': 'name',
+      'description': 'description',
+      'category': 'category',
+      'industry': 'industry',
+      'base_price': 'price', // Map
+      'stock_quantity': 'in_stock', // Map
+      'is_active': 'is_active',
+      'specifications': 'technical_specs' // Map
+    }
     
-    for (const field of allowedFields) {
-      if (body[field] !== undefined) {
-        updates.push(`${field} = ?`)
-        if (field === 'specifications' && body[field]) {
-          values.push(JSON.stringify(body[field]))
-        } else if (field === 'is_active') {
-          values.push(body[field] ? 1 : 0)
+    for (const [apiField, dbField] of Object.entries(fieldMapping)) {
+      if (body[apiField] !== undefined) {
+        updates.push(`${dbField} = ?`)
+        if (apiField === 'specifications' && body[apiField]) {
+          values.push(JSON.stringify(body[apiField]))
+        } else if (apiField === 'stock_quantity') {
+          // Convert to integer for in_stock
+          values.push(body[apiField] ? 1 : 0)
+        } else if (apiField === 'is_active') {
+          values.push(body[apiField] ? 1 : 0)
         } else {
-          values.push(body[field])
+          values.push(body[apiField])
         }
       }
     }
