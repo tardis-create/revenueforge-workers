@@ -2032,6 +2032,48 @@ app.get('/api/email-templates', authMiddleware, async (c) => {
   }
 })
 
+// GET /api/email-templates/:id/preview - Render template with sample data
+app.get('/api/email-templates/:id/preview', authMiddleware, async (c) => {
+  try {
+    const id = c.req.param('id')
+    const template = await c.env.DB.prepare(
+      'SELECT * FROM email_templates WHERE id = ?'
+    ).bind(id).first() as any
+
+    if (!template) {
+      return c.json({ error: 'Template not found' }, 404)
+    }
+
+    const variables: string[] = template.variables ? JSON.parse(template.variables) : []
+    const sampleData: Record<string, string> = {}
+    const toSampleValue = (v: string): string => {
+      const lv = v.toLowerCase()
+      if (lv.includes('name')) return 'John Doe'
+      if (lv.includes('email')) return 'john.doe@example.com'
+      if (lv.includes('company') || lv.includes('org')) return 'Acme Corp'
+      if (lv.includes('date')) return new Date().toLocaleDateString('en-US')
+      if (lv.includes('amount') || lv.includes('price') || lv.includes('total')) return '$99.00'
+      if (lv.includes('url') || lv.includes('link')) return 'https://example.com'
+      if (lv.includes('phone')) return '+1 (555) 000-0000'
+      return v.replace(/_/g, ' ')
+    }
+    for (const v of variables) sampleData[v] = toSampleValue(v)
+    const bodyText: string = template.body
+    const tokenRegex = /\{\{(\w+)\}\}/g
+    let match: RegExpExecArray | null
+    while ((match = tokenRegex.exec(bodyText)) !== null) {
+      if (!(match[1] in sampleData)) sampleData[match[1]] = toSampleValue(match[1])
+    }
+    const renderedBody = bodyText.replace(/\{\{(\w+)\}\}/g, (_: string, t: string) => sampleData[t] ?? `[${t}]`)
+    const renderedSubject = (template.subject as string).replace(/\{\{(\w+)\}\}/g, (_: string, t: string) => sampleData[t] ?? `[${t}]`)
+
+    return c.json({ success: true, preview: { id: template.id, name: template.name, subject: renderedSubject, body: renderedBody, sample_data: sampleData } })
+  } catch (error) {
+    console.error('Preview email template error:', error)
+    return c.json({ error: 'Failed to generate template preview' }, 500)
+  }
+})
+
 // GET /api/email-templates/:id - Single template
 app.get('/api/email-templates/:id', authMiddleware, async (c) => {
   try {
@@ -3364,6 +3406,102 @@ app.patch('/api/settings', authMiddleware, async (c) => {
     return c.json({ error: 'Failed to update settings' }, 500)
   }
 })
+
+// ── Analytics API (RF-B10) ─────────────────────────────────────────────────
+
+function getAnalyticsDateRange(from: string | undefined, to: string | undefined, column: string): { clause: string; params: string[] } {
+  const params: string[] = [];
+  const parts: string[] = [];
+  if (from) { parts.push(`${column} >= ?`); params.push(from); }
+  if (to)   { parts.push(`${column} <= ?`); params.push(to); }
+  return { clause: parts.length > 0 ? ' AND ' + parts.join(' AND ') : '', params };
+}
+
+// GET /api/analytics/overview
+app.get('/api/analytics/overview', authMiddleware, async (c) => {
+  const db = c.env.DB;
+  const from = c.req.query('from'); const to = c.req.query('to');
+  const lr = getAnalyticsDateRange(from, to, 'created_at');
+  const qr = getAnalyticsDateRange(from, to, 'created_at');
+  const [leadsResult, revenueResult, conversionResult, productsResult, rfqResult, openQuotesResult] = await Promise.all([
+    db.prepare(`SELECT COUNT(*) as total FROM leads WHERE 1=1${lr.clause}`).bind(...lr.params).first<{ total: number }>(),
+    db.prepare(`SELECT COALESCE(SUM(amount), 0) as total FROM quotes WHERE status = 'accepted'${qr.clause}`).bind(...qr.params).first<{ total: number }>(),
+    db.prepare(`SELECT COUNT(*) as total, SUM(CASE WHEN status = 'won' THEN 1 ELSE 0 END) as won FROM leads WHERE 1=1${lr.clause}`).bind(...lr.params).first<{ total: number; won: number }>(),
+    db.prepare(`SELECT COUNT(*) as total FROM products WHERE is_active = 1`).first<{ total: number }>(),
+    db.prepare(`SELECT COUNT(*) as total FROM rfq_submissions WHERE 1=1${lr.clause}`).bind(...lr.params).first<{ total: number }>(),
+    db.prepare(`SELECT COUNT(*) as total FROM quotes WHERE status NOT IN ('accepted','rejected','expired')${qr.clause}`).bind(...qr.params).first<{ total: number }>(),
+  ]);
+  const totalLeads = leadsResult?.total ?? 0;
+  const wonLeads = conversionResult?.won ?? 0;
+  const conversionRate = totalLeads > 0 ? Math.round((wonLeads / totalLeads) * 100 * 100) / 100 : 0;
+  return c.json({ overview: { total_leads: totalLeads, total_revenue: revenueResult?.total ?? 0, conversion_rate: conversionRate, active_products: productsResult?.total ?? 0, total_rfqs: rfqResult?.total ?? 0, won_leads: wonLeads, open_quotes: openQuotesResult?.total ?? 0 } });
+});
+
+// GET /api/analytics/leads
+app.get('/api/analytics/leads', authMiddleware, async (c) => {
+  const db = c.env.DB;
+  const from = c.req.query('from'); const to = c.req.query('to');
+  const { clause, params } = getAnalyticsDateRange(from, to, 'created_at');
+  const [byStatus, bySource, recentLeads] = await Promise.all([
+    db.prepare(`SELECT status, COUNT(*) as count FROM leads WHERE 1=1${clause} GROUP BY status ORDER BY count DESC`).bind(...params).all<{ status: string; count: number }>(),
+    db.prepare(`SELECT COALESCE(source,'unknown') as source, COUNT(*) as count FROM leads WHERE 1=1${clause} GROUP BY source ORDER BY count DESC`).bind(...params).all<{ source: string; count: number }>(),
+    db.prepare(`SELECT DATE(created_at) as date, COUNT(*) as count FROM leads WHERE created_at >= DATE('now','-30 days')${clause} GROUP BY DATE(created_at) ORDER BY date ASC`).bind(...params).all<{ date: string; count: number }>(),
+  ]);
+  return c.json({ leads: { by_status: byStatus.results, by_source: bySource.results, trend_30d: recentLeads.results } });
+});
+
+// GET /api/analytics/revenue
+app.get('/api/analytics/revenue', authMiddleware, async (c) => {
+  const db = c.env.DB;
+  const from = c.req.query('from'); const to = c.req.query('to');
+  const { clause, params } = getAnalyticsDateRange(from, to, 'created_at');
+  const [monthly, byCurrency, summary] = await Promise.all([
+    db.prepare(`SELECT STRFTIME('%Y-%m', accepted_at) as month, COALESCE(SUM(amount),0) as revenue, COUNT(*) as count FROM quotes WHERE status='accepted' AND accepted_at IS NOT NULL${clause} GROUP BY STRFTIME('%Y-%m', accepted_at) ORDER BY month ASC`).bind(...params).all<{ month: string; revenue: number; count: number }>(),
+    db.prepare(`SELECT currency, COALESCE(SUM(amount),0) as total, COUNT(*) as count FROM quotes WHERE status='accepted'${clause} GROUP BY currency ORDER BY total DESC`).bind(...params).all<{ currency: string; total: number; count: number }>(),
+    db.prepare(`SELECT COALESCE(SUM(amount),0) as total_revenue, COALESCE(AVG(amount),0) as avg_deal_size, COUNT(*) as total_deals FROM quotes WHERE status='accepted'${clause}`).bind(...params).first<{ total_revenue: number; avg_deal_size: number; total_deals: number }>(),
+  ]);
+  return c.json({ revenue: { monthly_trend: monthly.results, by_currency: byCurrency.results, total_revenue: summary?.total_revenue ?? 0, avg_deal_size: Math.round((summary?.avg_deal_size ?? 0) * 100) / 100, total_deals: summary?.total_deals ?? 0 } });
+});
+
+// GET /api/analytics/conversion
+app.get('/api/analytics/conversion', authMiddleware, async (c) => {
+  const db = c.env.DB;
+  const from = c.req.query('from'); const to = c.req.query('to');
+  const lr = getAnalyticsDateRange(from, to, 'created_at');
+  const qr = getAnalyticsDateRange(from, to, 'created_at');
+  const [leadFunnel, quoteFunnel, overallRate] = await Promise.all([
+    db.prepare(`SELECT status, COUNT(*) as count FROM leads WHERE 1=1${lr.clause} GROUP BY status`).bind(...lr.params).all<{ status: string; count: number }>(),
+    db.prepare(`SELECT status, COUNT(*) as count FROM quotes WHERE 1=1${qr.clause} GROUP BY status`).bind(...qr.params).all<{ status: string; count: number }>(),
+    db.prepare(`SELECT COUNT(*) as total, SUM(CASE WHEN status='won' THEN 1 ELSE 0 END) as won FROM leads WHERE 1=1${lr.clause}`).bind(...lr.params).first<{ total: number; won: number }>(),
+  ]);
+  const total = overallRate?.total ?? 0; const won = overallRate?.won ?? 0;
+  const rate = total > 0 ? Math.round((won / total) * 100 * 100) / 100 : 0;
+  const lsm: Record<string,number> = {}; for (const r of leadFunnel.results) lsm[r.status] = r.count;
+  const qsm: Record<string,number> = {}; for (const r of quoteFunnel.results) qsm[r.status] = r.count;
+  return c.json({ conversion: { overall_rate: rate, total_leads: total, won_leads: won, funnel: { new: lsm['new']??0, qualified: lsm['qualified']??0, rfq: lsm['rfq']??0, quoted: lsm['quoted']??0, won: lsm['won']??0, lost: lsm['lost']??0 }, quotes: { draft: qsm['draft']??0, sent: qsm['sent']??0, accepted: qsm['accepted']??0, rejected: qsm['rejected']??0, expired: qsm['expired']??0 } } });
+});
+
+// GET /api/analytics/top-products
+app.get('/api/analytics/top-products', authMiddleware, async (c) => {
+  const db = c.env.DB;
+  const limit = parseInt(c.req.query('limit') ?? '10', 10);
+  const from = c.req.query('from'); const to = c.req.query('to');
+  const { clause, params } = getAnalyticsDateRange(from, to, 'q.created_at');
+  const result = await db.prepare(`SELECT p.id, p.name, p.category, p.price, COUNT(qi.id) as quote_count, COALESCE(SUM(qi.quantity),0) as total_quantity, COALESCE(SUM(qi.total_price),0) as total_value FROM products p LEFT JOIN quote_items qi ON qi.product_id=p.id LEFT JOIN quotes q ON q.id=qi.quote_id AND q.status='accepted'${clause} GROUP BY p.id ORDER BY total_value DESC, quote_count DESC LIMIT ?`).bind(...params, limit).all();
+  return c.json({ top_products: result.results });
+});
+
+// GET /api/analytics/top-dealers
+app.get('/api/analytics/top-dealers', authMiddleware, async (c) => {
+  const db = c.env.DB;
+  const limit = parseInt(c.req.query('limit') ?? '10', 10);
+  const from = c.req.query('from'); const to = c.req.query('to');
+  const { clause, params } = getAnalyticsDateRange(from, to, 'l.created_at');
+  const result = await db.prepare(`SELECT u.id, u.name, u.email, COUNT(l.id) as total_leads, SUM(CASE WHEN l.status='won' THEN 1 ELSE 0 END) as won_leads, COALESCE(SUM(CASE WHEN l.status='won' THEN l.estimated_value ELSE 0 END),0) as estimated_revenue, CASE WHEN COUNT(l.id)>0 THEN ROUND(CAST(SUM(CASE WHEN l.status='won' THEN 1 ELSE 0 END) AS REAL)/COUNT(l.id)*100,2) ELSE 0 END as win_rate FROM users u LEFT JOIN leads l ON l.assigned_to=u.id${clause} GROUP BY u.id ORDER BY won_leads DESC, estimated_revenue DESC LIMIT ?`).bind(...params, limit).all();
+  return c.json({ top_dealers: result.results });
+});
+
+// ── End Analytics API ──────────────────────────────────────────────────────
 
 // Cron handler for scheduled tasks
 export default {
