@@ -5,7 +5,13 @@
   "main": "dist/index.js",
   "scripts": {
     "test": "vitest run",
-    "build": "esbuild index.ts --bundle --outfile=dist/index.js --platform=node --target=node20 --format=esm --external:*.sql"
+    "build": "esbuild index.ts --bundle --outfile=dist/index.js --platform=node --target=node20 --format=esm --external:*.sql",
+    "migrate": "node scripts/migrate.js",
+    "migrate:status": "node scripts/migrate.js status",
+    "migrate:up": "node scripts/migrate.js up",
+    "migrate:rollback": "node scripts/migrate.js rollback",
+    "migrate:status:remote": "node scripts/migrate.js status --remote",
+    "migrate:up:remote": "node scripts/migrate.js up --remote"
   },
   "keywords": [],
   "author": "",
