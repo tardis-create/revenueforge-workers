@@ -3,12 +3,11 @@
 -- Adds initial seed data: admin user, products, templates
 
 -- Seed admin user (password: admin123)
--- Note: In production, use a properly hashed password
 INSERT INTO users (id, email, password_hash, first_name, last_name, role, phone, is_active, created_at, updated_at)
 VALUES (
   'usr_admin001',
   'admin@revenueforge.com',
-  '$2a$10$rVnKkQqXQJxCqKkfZxVmvOLqJ5fHzYzJYvKxZGQzYLHxRPEz9J8W', -- admin123
+  '$2a$10$rVnKkQqXQJxCqKkfZxVmvOLqJ5fHzYzJYvKxZGQzYLHxRPEz9J8W',
   'Admin',
   'User',
   'admin',
