@@ -1048,6 +1048,17 @@ app.post('/api/rfq', async (c) => {
   }
 })
 
+// Get all RFQs
+app.get('/api/rfqs', async (c) => {
+  try {
+    const { results } = await c.env.DB.prepare('SELECT * FROM rfq_submissions ORDER BY created_at DESC').all()
+    return c.json({ rfqs: results })
+  } catch (error) {
+    console.error('RFQs fetch error:', error)
+    return c.json({ error: 'Failed to fetch RFQs' }, 500)
+  }
+})
+
 // Leads (CRM)
 app.get('/api/leads', async (c) => {
   try {
@@ -1242,6 +1253,204 @@ Please follow up with this lead.`
   } catch (error) {
     console.error('Send reminders error:', error)
     return c.json({ error: 'Failed to send reminders' }, 500)
+  }
+})
+
+// ============ QUOTES API ============
+
+// Get all quotes (with optional status filter)
+app.get('/api/quotes', async (c) => {
+  try {
+    const status = c.req.query('status')
+    let query = 'SELECT * FROM quotes ORDER BY created_at DESC'
+    const params: any[] = []
+    
+    if (status && status !== 'all') {
+      query = 'SELECT * FROM quotes WHERE status = ? ORDER BY created_at DESC'
+      params.push(status)
+    }
+    
+    const { results } = await c.env.DB.prepare(query).bind(...params).all()
+    
+    // Fetch items for each quote
+    const quotes = (results || []) as Array<{ id: string }>
+    const quotesWithItems = await Promise.all(
+      quotes.map(async (quote) => {
+        const { results: items } = await c.env.DB.prepare(
+          'SELECT * FROM quote_items WHERE quote_id = ?'
+        ).bind(quote.id).all()
+        return { ...quote, items: items || [] }
+      })
+    )
+    
+    return c.json({ success: true, data: quotesWithItems })
+  } catch (error) {
+    console.error('Quotes fetch error:', error)
+    return c.json({ success: false, error: 'Failed to fetch quotes' }, 500)
+  }
+})
+
+// Get single quote
+app.get('/api/quotes/:id', async (c) => {
+  try {
+    const quote = await c.env.DB.prepare('SELECT * FROM quotes WHERE id = ?').bind(c.req.param('id')).first()
+    if (!quote) return c.json({ success: false, error: 'Quote not found' }, 404)
+    
+    const { results: items } = await c.env.DB.prepare(
+      'SELECT * FROM quote_items WHERE quote_id = ?'
+    ).bind(quote.id).all()
+    
+    return c.json({ success: true, data: { ...quote, items: items || [] } })
+  } catch (error) {
+    console.error('Quote fetch error:', error)
+    return c.json({ success: false, error: 'Failed to fetch quote' }, 500)
+  }
+})
+
+// Create quote
+app.post('/api/quotes', async (c) => {
+  try {
+    const body = await c.req.json()
+    const id = crypto.randomUUID()
+    const now = new Date().toISOString()
+    
+    // Calculate valid_until based on validity_days
+    const validityDays = body.validity_days || 30
+    const validUntil = new Date(Date.now() + validityDays * 24 * 60 * 60 * 1000).toISOString()
+    
+    // If rfq_id provided, fetch lead info
+    let companyName = body.company_name
+    let contactName = body.contact_name
+    let email = body.email
+    let phone = body.phone
+    
+    if (body.rfq_id) {
+      const lead = await c.env.DB.prepare('SELECT * FROM leads WHERE id = ?').bind(body.rfq_id).first() as any
+      if (lead) {
+        companyName = companyName || lead.company_name
+        contactName = contactName || lead.contact_name
+        email = email || lead.email
+        phone = phone || lead.phone
+      }
+    }
+    
+    // Calculate total amount from items
+    const items = body.items || []
+    const amount = items.reduce((sum: number, item: any) => sum + (item.total_price || 0), 0)
+    
+    await c.env.DB.prepare(`
+      INSERT INTO quotes (id, rfq_id, company_name, contact_name, email, phone, amount, currency, validity_days, valid_until, terms, status, notes, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      id,
+      body.rfq_id || null,
+      companyName,
+      contactName,
+      email,
+      phone,
+      amount,
+      body.currency || 'USD',
+      validityDays,
+      validUntil,
+      body.terms || null,
+      body.status || 'draft',
+      body.notes || null,
+      now,
+      now
+    ).run()
+    
+    // Insert quote items
+    for (const item of items) {
+      const itemId = crypto.randomUUID()
+      await c.env.DB.prepare(`
+        INSERT INTO quote_items (id, quote_id, product_id, description, quantity, unit_price, total_price, product_name)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        itemId,
+        id,
+        item.product_id || null,
+        item.description || null,
+        item.quantity || 1,
+        item.unit_price || 0,
+        item.total_price || 0,
+        item.product_name || null
+      ).run()
+    }
+    
+    // Fetch the created quote with items
+    const quote = await c.env.DB.prepare('SELECT * FROM quotes WHERE id = ?').bind(id).first()
+    const { results: quoteItems } = await c.env.DB.prepare('SELECT * FROM quote_items WHERE quote_id = ?').bind(id).all()
+    
+    return c.json({ success: true, data: { ...quote, items: quoteItems || [] } })
+  } catch (error) {
+    console.error('Quote create error:', error)
+    return c.json({ success: false, error: 'Failed to create quote' }, 500)
+  }
+})
+
+// Update quote status
+app.patch('/api/quotes/:id/status', async (c) => {
+  try {
+    const body = await c.req.json()
+    const now = new Date().toISOString()
+    const newStatus = body.status
+    
+    // Get current quote
+    const quote = await c.env.DB.prepare('SELECT * FROM quotes WHERE id = ?').bind(c.req.param('id')).first() as any
+    if (!quote) return c.json({ success: false, error: 'Quote not found' }, 404)
+    
+    // Build update query based on status
+    let sentAt = quote.sent_at
+    let acceptedAt = quote.accepted_at
+    let rejectedAt = quote.rejected_at
+    
+    if (newStatus === 'sent' && !quote.sent_at) {
+      sentAt = now
+    } else if (newStatus === 'accepted' && !quote.accepted_at) {
+      acceptedAt = now
+    } else if (newStatus === 'rejected' && !quote.rejected_at) {
+      rejectedAt = now
+    }
+    
+    await c.env.DB.prepare(`
+      UPDATE quotes SET status = ?, sent_at = ?, accepted_at = ?, rejected_at = ?, updated_at = ?
+      WHERE id = ?
+    `).bind(newStatus, sentAt, acceptedAt, rejectedAt, now, c.req.param('id')).run()
+    
+    // Fetch updated quote
+    const updatedQuote = await c.env.DB.prepare('SELECT * FROM quotes WHERE id = ?').bind(c.req.param('id')).first()
+    const { results: items } = await c.env.DB.prepare('SELECT * FROM quote_items WHERE quote_id = ?').bind(c.req.param('id')).all()
+    
+    // Send email notification if quote is sent
+    if (newStatus === 'sent' && quote.email) {
+      const emailHtml = `
+        <h2>Your Quotation from RevenueForge</h2>
+        <p>Dear ${quote.contact_name || 'Customer'},</p>
+        <p>Please find attached your quotation. This quote is valid until ${new Date(quote.valid_until).toLocaleDateString()}.</p>
+        <p>Total Amount: ${quote.currency || 'USD'} ${quote.amount.toFixed(2)}</p>
+        <p>If you have any questions or would like to proceed, please reply to this email.</p>
+        <p>Best regards,<br>RevenueForge Team</p>
+      `
+      
+      await sendEmail(c.env, quote.email, 'Your Quotation - RevenueForge', emailHtml)
+    }
+    
+    return c.json({ success: true, data: { ...updatedQuote, items: items || [] } })
+  } catch (error) {
+    console.error('Quote status update error:', error)
+    return c.json({ success: false, error: 'Failed to update quote status' }, 500)
+  }
+})
+
+// Delete quote
+app.delete('/api/quotes/:id', async (c) => {
+  try {
+    await c.env.DB.prepare('DELETE FROM quote_items WHERE quote_id = ?').bind(c.req.param('id')).run()
+    await c.env.DB.prepare('DELETE FROM quotes WHERE id = ?').bind(c.req.param('id')).run()
+    return c.json({ success: true })
+  } catch (error) {
+    console.error('Quote delete error:', error)
+    return c.json({ success: false, error: 'Failed to delete quote' }, 500)
   }
 })
 
