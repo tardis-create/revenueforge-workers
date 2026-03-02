@@ -1817,6 +1817,132 @@ app.patch('/api/settings', authMiddleware, async (c) => {
   }
 })
 
+// ============================================
+// DEALER PORTAL API
+// ============================================
+
+// GET /api/dealer/orders - List orders filtered by dealer_id
+app.get('/api/dealer/orders', authMiddleware, async (c) => {
+  try {
+    const user = c.get('user') as any
+    const dealerId = user.user_id
+    
+    // Parse query params for filtering
+    const status = c.req.query('status')
+    const page = Math.max(1, parseInt(c.req.query('page') || '1'))
+    const limit = Math.min(100, Math.max(1, parseInt(c.req.query('limit') || '20')))
+    const offset = (page - 1) * limit
+    
+    // Build query
+    let whereClause = 'dealer_id = ?'
+    const params: any[] = [dealerId]
+    
+    if (status) {
+      whereClause += ' AND status = ?'
+      params.push(status)
+    }
+    
+    // Get total count
+    const countResult = await c.env.DB.prepare(
+      `SELECT COUNT(*) as total FROM orders WHERE ${whereClause}`
+    ).bind(...params).first() as { total: number }
+    const total = countResult?.total || 0
+    
+    // Get paginated results
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, dealer_id, product_id, product_name, quantity, unit_price, 
+              total_amount, currency, status, notes, created_at, updated_at
+       FROM orders 
+       WHERE ${whereClause}
+       ORDER BY created_at DESC
+       LIMIT ? OFFSET ?`
+    ).bind(...params, limit, offset).all()
+    
+    return c.json({
+      success: true,
+      data: results || [],
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+        hasMore: offset + limit < total
+      }
+    })
+  } catch (error) {
+    console.error('Error fetching dealer orders:', error)
+    return c.json({ error: 'Failed to fetch orders' }, 500)
+  }
+})
+
+// GET /api/dealer/commissions - List commissions filtered by dealer_id
+app.get('/api/dealer/commissions', authMiddleware, async (c) => {
+  try {
+    const user = c.get('user') as any
+    const dealerId = user.user_id
+    
+    // Parse query params for filtering
+    const status = c.req.query('status')
+    const page = Math.max(1, parseInt(c.req.query('page') || '1'))
+    const limit = Math.min(100, Math.max(1, parseInt(c.req.query('limit') || '20')))
+    const offset = (page - 1) * limit
+    
+    // Build query
+    let whereClause = 'dealer_id = ?'
+    const params: any[] = [dealerId]
+    
+    if (status) {
+      whereClause += ' AND status = ?'
+      params.push(status)
+    }
+    
+    // Get total count
+    const countResult = await c.env.DB.prepare(
+      `SELECT COUNT(*) as total FROM commissions WHERE ${whereClause}`
+    ).bind(...params).first() as { total: number }
+    const total = countResult?.total || 0
+    
+    // Get paginated results
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, dealer_id, order_id, amount, percentage, status, notes, 
+              created_at, updated_at, paid_at
+       FROM commissions 
+       WHERE ${whereClause}
+       ORDER BY created_at DESC
+       LIMIT ? OFFSET ?`
+    ).bind(...params, limit, offset).all()
+    
+    // Calculate totals
+    const totalsResult = await c.env.DB.prepare(
+      `SELECT 
+         SUM(CASE WHEN status = 'pending' THEN amount ELSE 0 END) as pending_total,
+         SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END) as paid_total,
+         SUM(amount) as total_commissions
+       FROM commissions WHERE dealer_id = ?`
+    ).bind(dealerId).first() as { pending_total: number; paid_total: number; total_commissions: number }
+    
+    return c.json({
+      success: true,
+      data: results || [],
+      summary: {
+        pending: totalsResult?.pending_total || 0,
+        paid: totalsResult?.paid_total || 0,
+        total: totalsResult?.total_commissions || 0
+      },
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+        hasMore: offset + limit < total
+      }
+    })
+  } catch (error) {
+    console.error('Error fetching dealer commissions:', error)
+    return c.json({ error: 'Failed to fetch commissions' }, 500)
+  }
+})
+
 // Cron handler for scheduled tasks
 export default {
   async fetch(request: Request, env: Bindings, ctx: ExecutionContext): Promise<Response> {
