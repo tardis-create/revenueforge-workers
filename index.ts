@@ -1904,8 +1904,8 @@ app.get('/api/dealer/commissions', authMiddleware, async (c) => {
     
     // Get paginated results
     const { results } = await c.env.DB.prepare(
-      `SELECT id, dealer_id, order_id, amount, percentage, status, notes, 
-              created_at, updated_at, paid_at
+      `SELECT id, dealer_id, lead_id, rfq_id, amount, currency, status, notes, 
+              paid_at, created_at, updated_at
        FROM commissions 
        WHERE ${whereClause}
        ORDER BY created_at DESC
