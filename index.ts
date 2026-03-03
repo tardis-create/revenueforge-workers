@@ -130,6 +130,29 @@ async function authMiddleware(c: any, next: () => Promise<void>) {
   await next()
 }
 
+// Admin middleware - requires admin role
+async function adminMiddleware(c: any, next: () => Promise<void>) {
+  const cookies = parseCookies(c.req.header('Cookie'))
+  const token = cookies.token || c.req.header('Authorization')?.replace('Bearer ', '')
+  
+  if (!token) {
+    return c.json({ error: 'Authentication required' }, 401)
+  }
+  
+  const result = await verifyToken(token, c.env.JWT_SECRET)
+  
+  if (!result.valid) {
+    return c.json({ error: 'Invalid or expired token' }, 401)
+  }
+  
+  if (result.payload.role !== 'admin') {
+    return c.json({ error: 'Admin access required' }, 403)
+  }
+  
+  c.set('user', result.payload)
+  await next()
+}
+
 // Initialize Resend client
 function getResend(env: Bindings): Resend | null {
   if (!env.RESEND_API_KEY) return null
@@ -509,6 +532,365 @@ app.get('/api/auth/me', async (c) => {
   }
 })
 
+// ============================================
+// USERS API - Admin User Management
+// ============================================
+
+// GET /api/users - List all users (admin only)
+app.get('/api/users', adminMiddleware, async (c) => {
+  try {
+    const user = c.get('user')
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin access required' }, 403)
+    }
+
+    // Parse pagination params
+    const page = Math.max(1, parseInt(c.req.query('page') || '1'))
+    const limit = Math.min(100, Math.max(1, parseInt(c.req.query('limit') || '20')))
+    const offset = (page - 1) * limit
+    const search = c.req.query('search')
+    const role = c.req.query('role')
+    const includeInactive = c.req.query('includeInactive') === 'true'
+
+    // Build query
+    let whereClause = includeInactive ? '1=1' : 'is_active = 1'
+    const params: any[] = []
+
+    if (role) {
+      whereClause += ' AND role = ?'
+      params.push(role)
+    }
+
+    if (search) {
+      whereClause += ' AND (email LIKE ? OR first_name LIKE ? OR last_name LIKE ?)'
+      const searchPattern = `%${search}%`
+      params.push(searchPattern, searchPattern, searchPattern)
+    }
+
+    // Get total count
+    const countResult = await c.env.DB.prepare(`
+      SELECT COUNT(*) as total FROM users WHERE ${whereClause}
+    `).bind(...params).first() as any
+
+    // Get users
+    const users = await c.env.DB.prepare(`
+      SELECT id, email, first_name, last_name, role, phone, is_active, last_login_at, created_at, updated_at
+      FROM users WHERE ${whereClause}
+      ORDER BY created_at DESC
+      LIMIT ? OFFSET ?
+    `).bind(...params, limit, offset).all() as any
+
+    return c.json({
+      success: true,
+      data: users.results.map((u: any) => ({
+        id: u.id,
+        email: u.email,
+        first_name: u.first_name,
+        last_name: u.last_name,
+        name: [u.first_name, u.last_name].filter(Boolean).join(' '),
+        role: u.role,
+        phone: u.phone,
+        is_active: !!u.is_active,
+        last_login_at: u.last_login_at,
+        created_at: u.created_at,
+        updated_at: u.updated_at
+      })),
+      pagination: {
+        page,
+        limit,
+        total: countResult?.total || 0,
+        totalPages: Math.ceil((countResult?.total || 0) / limit)
+      }
+    })
+  } catch (error) {
+    console.error('List users error:', error)
+    return c.json({ error: 'Failed to list users' }, 500)
+  }
+})
+
+// GET /api/users/:id - Get a specific user (admin only)
+app.get('/api/users/:id', adminMiddleware, async (c) => {
+  try {
+    const user = c.get('user')
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin access required' }, 403)
+    }
+
+    const id = c.req.param('id')
+
+    const result = await c.env.DB.prepare(`
+      SELECT id, email, first_name, last_name, role, phone, is_active, last_login_at, created_at, updated_at
+      FROM users WHERE id = ?
+    `).bind(id).first() as any
+
+    if (!result) {
+      return c.json({ error: 'User not found' }, 404)
+    }
+
+    return c.json({
+      success: true,
+      data: {
+        id: result.id,
+        email: result.email,
+        first_name: result.first_name,
+        last_name: result.last_name,
+        name: [result.first_name, result.last_name].filter(Boolean).join(' '),
+        role: result.role,
+        phone: result.phone,
+        is_active: !!result.is_active,
+        last_login_at: result.last_login_at,
+        created_at: result.created_at,
+        updated_at: result.updated_at
+      }
+    })
+  } catch (error) {
+    console.error('Get user error:', error)
+    return c.json({ error: 'Failed to get user' }, 500)
+  }
+})
+
+// POST /api/users - Create a new user (admin only)
+app.post('/api/users', adminMiddleware, async (c) => {
+  try {
+    const adminUser = c.get('user')
+    if (adminUser.role !== 'admin') {
+      return c.json({ error: 'Admin access required' }, 403)
+    }
+
+    const body = await c.req.json()
+    const { email, password, first_name, last_name, role, phone } = body
+
+    if (!email || !password) {
+      return c.json({ error: 'Email and password are required' }, 400)
+    }
+
+    // Validate role
+    const validRoles = ['user', 'dealer', 'admin']
+    if (role && !validRoles.includes(role)) {
+      return c.json({ error: 'Invalid role. Must be one of: user, dealer, admin' }, 400)
+    }
+
+    // Check if email already exists
+    const existing = await c.env.DB.prepare(`
+      SELECT id FROM users WHERE email = ?
+    `).bind(email.toLowerCase()).first() as any
+
+    if (existing) {
+      return c.json({ error: 'Email already exists' }, 400)
+    }
+
+    // Generate ID and timestamps
+    const id = crypto.randomUUID()
+    const now = new Date().toISOString()
+    const passwordHash = await hashPassword(password)
+
+    // Insert user
+    await c.env.DB.prepare(`
+      INSERT INTO users (id, email, password_hash, first_name, last_name, role, phone, is_active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      id,
+      email.toLowerCase(),
+      passwordHash,
+      first_name || null,
+      last_name || null,
+      role || 'user',
+      phone || null,
+      1,
+      now,
+      now
+    ).run()
+
+    // Don't return the password hash
+    return c.json({
+      success: true,
+      data: {
+        id,
+        email: email.toLowerCase(),
+        first_name: first_name || null,
+        last_name: last_name || null,
+        name: [first_name, last_name].filter(Boolean).join(' '),
+        role: role || 'user',
+        phone: phone || null,
+        is_active: true,
+        created_at: now,
+        updated_at: now
+      }
+    }, 201)
+  } catch (error) {
+    console.error('Create user error:', error)
+    return c.json({ error: 'Failed to create user' }, 500)
+  }
+})
+
+// PATCH /api/users/:id - Update a user (admin only)
+app.patch('/api/users/:id', adminMiddleware, async (c) => {
+  try {
+    const adminUser = c.get('user')
+    if (adminUser.role !== 'admin') {
+      return c.json({ error: 'Admin access required' }, 403)
+    }
+
+    const id = c.req.param('id')
+    const body = await c.req.json()
+    const { first_name, last_name, role, phone, is_active } = body
+
+    // Check if user exists
+    const existing = await c.env.DB.prepare(`
+      SELECT id FROM users WHERE id = ?
+    `).bind(id).first() as any
+
+    if (!existing) {
+      return c.json({ error: 'User not found' }, 404)
+    }
+
+    // Prevent removing own admin role
+    if (id === adminUser.user_id && role && role !== 'admin') {
+      return c.json({ error: 'Cannot remove your own admin role' }, 400)
+    }
+
+    // Build update query dynamically
+    const updates: string[] = []
+    const params: any[] = []
+
+    if (first_name !== undefined) {
+      updates.push('first_name = ?')
+      params.push(first_name)
+    }
+    if (last_name !== undefined) {
+      updates.push('last_name = ?')
+      params.push(last_name)
+    }
+    if (role !== undefined) {
+      const validRoles = ['user', 'dealer', 'admin']
+      if (!validRoles.includes(role)) {
+        return c.json({ error: 'Invalid role. Must be one of: user, dealer, admin' }, 400)
+      }
+      updates.push('role = ?')
+      params.push(role)
+    }
+    if (phone !== undefined) {
+      updates.push('phone = ?')
+      params.push(phone)
+    }
+    if (is_active !== undefined) {
+      updates.push('is_active = ?')
+      params.push(is_active ? 1 : 0)
+    }
+
+    if (updates.length === 0) {
+      return c.json({ error: 'No fields to update' }, 400)
+    }
+
+    updates.push('updated_at = ?')
+    params.push(new Date().toISOString())
+    params.push(id)
+
+    await c.env.DB.prepare(`
+      UPDATE users SET ${updates.join(', ')} WHERE id = ?
+    `).bind(...params).run()
+
+    // Fetch updated user
+    const updatedUser = await c.env.DB.prepare(`
+      SELECT id, email, first_name, last_name, role, phone, is_active, last_login_at, created_at, updated_at
+      FROM users WHERE id = ?
+    `).bind(id).first() as any
+
+    return c.json({
+      success: true,
+      data: {
+        id: updatedUser.id,
+        email: updatedUser.email,
+        first_name: updatedUser.first_name,
+        last_name: updatedUser.last_name,
+        name: [updatedUser.first_name, updatedUser.last_name].filter(Boolean).join(' '),
+        role: updatedUser.role,
+        phone: updatedUser.phone,
+        is_active: !!updatedUser.is_active,
+        last_login_at: updatedUser.last_login_at,
+        created_at: updatedUser.created_at,
+        updated_at: updatedUser.updated_at
+      }
+    })
+  } catch (error) {
+    console.error('Update user error:', error)
+    return c.json({ error: 'Failed to update user' }, 500)
+  }
+})
+
+// DELETE /api/users/:id - Soft delete (deactivate) a user (admin only)
+app.delete('/api/users/:id', adminMiddleware, async (c) => {
+  try {
+    const adminUser = c.get('user')
+    if (adminUser.role !== 'admin') {
+      return c.json({ error: 'Admin access required' }, 403)
+    }
+
+    const id = c.req.param('id')
+
+    // Check if user exists
+    const existing = await c.env.DB.prepare(`
+      SELECT id, email, role FROM users WHERE id = ?
+    `).bind(id).first() as any
+
+    if (!existing) {
+      return c.json({ error: 'User not found' }, 404)
+    }
+
+    // Prevent deactivating yourself
+    if (id === adminUser.user_id) {
+      return c.json({ error: 'Cannot deactivate your own account' }, 400)
+    }
+
+    // Soft delete - just set is_active to 0
+    await c.env.DB.prepare(`
+      UPDATE users SET is_active = 0, updated_at = ? WHERE id = ?
+    `).bind(new Date().toISOString(), id).run()
+
+    return c.json({
+      success: true,
+      message: 'User deactivated successfully'
+    })
+  } catch (error) {
+    console.error('Delete user error:', error)
+    return c.json({ error: 'Failed to delete user' }, 500)
+  }
+})
+
+// POST /api/users/:id/reactivate - Reactivate a user (admin only)
+app.post('/api/users/:id/reactivate', adminMiddleware, async (c) => {
+  try {
+    const adminUser = c.get('user')
+    if (adminUser.role !== 'admin') {
+      return c.json({ error: 'Admin access required' }, 403)
+    }
+
+    const id = c.req.param('id')
+
+    // Check if user exists
+    const existing = await c.env.DB.prepare(`
+      SELECT id FROM users WHERE id = ?
+    `).bind(id).first() as any
+
+    if (!existing) {
+      return c.json({ error: 'User not found' }, 404)
+    }
+
+    // Reactivate user
+    await c.env.DB.prepare(`
+      UPDATE users SET is_active = 1, updated_at = ? WHERE id = ?
+    `).bind(new Date().toISOString(), id).run()
+
+    return c.json({
+      success: true,
+      message: 'User reactivated successfully'
+    })
+  } catch (error) {
+    console.error('Reactivate user error:', error)
+    return c.json({ error: 'Failed to reactivate user' }, 500)
+  }
+})
+
 // Contact form
 app.post('/api/contact', async (c) => {
   try {
@@ -545,29 +927,6 @@ async function invalidateProductCache(c: any, productId: string): Promise<void> 
     await c.env.CACHE.delete(`${PRODUCT_CACHE_PREFIX}${productId}`)
     await c.env.CACHE.delete(PRODUCTS_CACHE_KEY)
   }
-}
-
-// Admin middleware for product CUD operations
-async function adminMiddleware(c: any, next: () => Promise<void>) {
-  const cookies = parseCookies(c.req.header('Cookie'))
-  const token = cookies.token || c.req.header('Authorization')?.replace('Bearer ', '')
-  
-  if (!token) {
-    return c.json({ error: 'Authentication required' }, 401)
-  }
-  
-  const result = await verifyToken(token, c.env.JWT_SECRET)
-  
-  if (!result.valid) {
-    return c.json({ error: 'Invalid or expired token' }, 401)
-  }
-  
-  if (result.payload.role !== 'admin') {
-    return c.json({ error: 'Admin access required' }, 403)
-  }
-  
-  c.set('user', result.payload)
-  await next()
 }
 
 // GET /api/products - Returns all products with pagination (public)
