@@ -11,6 +11,7 @@
 
 import { spawnSync } from 'child_process'
 import { readdirSync, readFileSync, writeFileSync, existsSync } from 'fs'
+import { createHash } from 'crypto'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 
@@ -87,9 +88,17 @@ function getAppliedMigrations() {
   return d1Query('SELECT version, name, applied_at, rolled_back FROM schema_migrations ORDER BY version ASC')
 }
 
+// Validate version is safe (numeric only) to prevent SQL injection
+function validateVersion(version) {
+  if (!/^\d+$/.test(version)) {
+    console.error('SECURITY: Invalid version format - rejecting: ' + version)
+    process.exit(1)
+  }
+  return version
+}
+
 function checksum(content) {
-  const clean = content.replace(/\s+/g, ' ').trim()
-  return String(clean.length)
+  return createHash('sha256').update(content, 'utf8').digest('hex')
 }
 
 function cmdStatus() {
@@ -124,11 +133,13 @@ function cmdUp() {
   for (const migration of pending) {
     const sql = readFileSync(migration.path, 'utf8')
     const cs = checksum(sql)
+    // Validate version to prevent SQL injection
+    const safeVersion = validateVersion(migration.version)
     console.log('  Applying ' + migration.filename)
     d1ExecuteFile(migration.path, 'Running SQL')
     d1Execute(
-      "INSERT OR REPLACE INTO schema_migrations (version, name, applied_at, checksum, rolled_back) VALUES ('" + migration.version + "', '" + migration.name.replace(/'/g, "''") + "', datetime('now'), '" + cs + "', 0);",
-      'Recording version ' + migration.version
+      "INSERT OR REPLACE INTO schema_migrations (version, name, applied_at, checksum, rolled_back) VALUES ('" + safeVersion + "', '" + migration.name.replace(/'/g, "''") + "', datetime('now'), '" + cs + "', 0);",
+      'Recording version ' + safeVersion
     )
     console.log('  Applied: ' + migration.filename + '\n')
   }
@@ -144,6 +155,8 @@ function cmdRollback() {
     return
   }
   const last = applied[applied.length - 1]
+  // Validate version to prevent SQL injection
+  const safeVersion = validateVersion(last.version)
   const rollbackFile = join(MIGRATIONS_DIR, last.version + '_' + last.name + '.rollback.sql')
   if (existsSync(rollbackFile)) {
     console.log('  Found rollback file: ' + last.version + '_' + last.name + '.rollback.sql')
@@ -153,7 +166,7 @@ function cmdRollback() {
     console.log('  Expected: migrations/' + last.version + '_' + last.name + '.rollback.sql')
     console.log('  Marking as rolled back in tracking table only (schema NOT reversed).\n')
   }
-  d1Execute("UPDATE schema_migrations SET rolled_back = 1 WHERE version = '" + last.version + "';", 'Updating status')
+  d1Execute("UPDATE schema_migrations SET rolled_back = 1 WHERE version = '" + safeVersion + "';", 'Updating status')
   console.log('\n  Rolled back: ' + last.version + '_' + last.name + '\n')
 }
 
@@ -173,6 +186,34 @@ function cmdCreate(name) {
   writeFileSync(rollbackPath, '-- Rollback: ' + name + '\n-- Reverses: ' + filename + '\n\n-- Write your rollback SQL here\n')
   console.log('\n  Created: ' + filename)
   console.log('  Created: ' + rollbackFilename + '\n')
+}
+
+function cmdBaseline() {
+  console.log('\n📍 Baseline: marking all migrations as applied (' + (isRemote ? 'REMOTE' : 'LOCAL') + ' D1)\n')
+  ensureMigrationsTable()
+  const files = getMigrationFiles()
+  const applied = getAppliedMigrations()
+  const appliedVersions = new Set(applied.filter(r => !r.rolled_back).map(r => r.version))
+
+  if (files.length === 0) {
+    console.log('  No migration files found.\n')
+    return
+  }
+
+  let markedCount = 0
+  for (const file of files) {
+    if (!appliedVersions.has(file.version)) {
+      const sql = readFileSync(file.path, 'utf8')
+      const cs = checksum(sql)
+      const safeVersion = validateVersion(file.version)
+      d1Execute(
+        "INSERT OR REPLACE INTO schema_migrations (version, name, applied_at, checksum, rolled_back) VALUES ('" + safeVersion + "', '" + file.name.replace(/'/g, "''") + "', datetime('now'), '" + cs + "', 0);",
+        'Marking ' + file.filename + ' as applied'
+      )
+      markedCount++
+    }
+  }
+  console.log('\n  Done: Marked ' + markedCount + ' migration(s) as baseline.\n')
 }
 
 const HELP = `
