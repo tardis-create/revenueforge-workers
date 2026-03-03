@@ -1418,6 +1418,33 @@ app.get('/api/rfqs', async (c) => {
   }
 })
 
+app.patch('/api/rfqs/:id', authMiddleware, async (c) => {
+  try {
+    const id = c.req.param('id')
+    const body = await c.req.json<{ status?: string; notes?: string }>()
+    const now = new Date().toISOString()
+    // Map frontend status values to DB constraint values
+    const statusMap: Record<string, string> = {
+      reviewing: 'contacted', accepted: 'won', rejected: 'lost',
+      new: 'new', contacted: 'contacted', quoted: 'quoted', won: 'won', lost: 'lost'
+    }
+    const updates: string[] = ['updated_at = ?']
+    const vals: unknown[] = [now]
+    if (body.status) { updates.push('status = ?'); vals.push(statusMap[body.status] || body.status); }
+    if (body.notes !== undefined) { updates.push('notes = ?'); vals.push(body.notes); }
+    vals.push(id)
+    await c.env.DB.prepare(
+      `UPDATE rfq_submissions SET ${updates.join(', ')} WHERE id = ?`
+    ).bind(...vals).run()
+    const rfq = await c.env.DB.prepare('SELECT * FROM rfq_submissions WHERE id = ?').bind(id).first()
+    return c.json({ rfq })
+  } catch (error) {
+    console.error('RFQ PATCH error:', error)
+    return c.json({ error: 'Failed to update RFQ' }, 500)
+  }
+})
+
+
 // Leads (CRM)
 app.get('/api/leads', async (c) => {
   try {
