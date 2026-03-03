@@ -943,13 +943,8 @@ app.get('/api/products', async (c) => {
     // Build cache key based on params
     const cacheKey = `${PRODUCTS_CACHE_KEY}:${page}:${limit}:${category || 'all'}:${search || 'none'}:${includeInactive}`
     
-    // Try cache first
-    if (c.env.CACHE) {
-      const cached = await c.env.CACHE.get(cacheKey, 'json')
-      if (cached) {
-        return c.json({ ...cached, cached: true })
-      }
-    }
+    // Cache disabled - always fresh
+    // if (c.env.CACHE) { ... }
     
     // Build query
     let whereClause = includeInactive ? '1=1' : 'is_active = 1'
@@ -1483,7 +1478,16 @@ app.patch('/api/leads/:id', async (c) => {
   try {
     const body = await c.req.json()
     const now = new Date().toISOString()
-    await c.env.DB.prepare('UPDATE leads SET status = ?, updated_at = ? WHERE id = ?').bind(body.status, now, c.req.param('id')).run()
+    const updates = []
+    const vals = []
+    if (body.status) { updates.push('status = ?'); vals.push(body.status); }
+    if (body.estimated_value !== undefined) { updates.push('estimated_value = ?'); vals.push(body.estimated_value); }
+    if (body.notes) { updates.push('notes = ?'); vals.push(body.notes); }
+    if (body.assigned_to) { updates.push('assigned_to = ?'); vals.push(body.assigned_to); }
+    updates.push('updated_at = ?')
+    vals.push(now)
+    vals.push(c.req.param('id'))
+    await c.env.DB.prepare(`UPDATE leads SET ${updates.join(', ')} WHERE id = ?`).bind(...vals).run()
     return c.json({ success: true })
   } catch (error) {
     return c.json({ error: 'Failed to update lead' }, 500)
