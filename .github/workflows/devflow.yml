@@ -1,0 +1,17 @@
+name: DevFlow Orchestrator
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Issue number to process'
+        required: true
+      phase:
+        description: 'Workflow phase'
+        required: true
+jobs:
+  orchestrate:
+    uses: tardis-pro/ai-dev-workflow-action/.github/workflows/orchestrator-multi-provider.yml@main
+    with:
+      issue_number: ${{ inputs.issue_number }}
+      phase: ${{ inputs.phase }}
+    secrets: inherit
